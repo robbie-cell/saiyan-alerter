@@ -5,6 +5,8 @@ Subcommands:
     live   — poll closed bars and forward events to Telegram (with dedupe + quiet hours).
     check  — run-once scan for cron (GitHub Actions): report bars closed since the
              last run, persisting per-pair progress in a state file.
+    daily  — send a daily Telegram recap (signals, closed trades, win rate, open
+             positions) for the last N hours, recomputed from candles.
 """
 from __future__ import annotations
 
@@ -70,16 +72,27 @@ def fetch_candles(exchange_id: str, symbol: str, timeframe: str,
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         return df.drop_duplicates(subset="timestamp").set_index("timestamp").sort_index()
 
+    # Paginated pages request at most 500 bars. Two exchange quirks force the
+    # partial-page tolerance below:
+    #   * Gate.io caps since-based responses at 999 bars (Binance at 1000), so a
+    #     full page can be exactly 999 — a strict `< page_size` test would
+    #     misfire as "end of history".
+    #   * Gate.io also returns `limit - 1` bars for since-based requests
+    #     (1000 → 999, 500 → 499). The tolerance (`< page_size - 1`) treats a
+    #     page as full unless it's two or more bars short, which is only true at
+    #     the genuine head of history on both exchanges.
+    page_size = min(limit, 500)
+
     seen: set = set()
     batches: list = []
     cursor = since_ms
-    # Pages needed = ceil(limit / per_call_cap), plus a small buffer for partial-page
+    # Pages needed = ceil(limit / page_size), plus a small buffer for partial-page
     # detection at the head of history. A buggy exchange that repeats the same bar
     # also exits this loop — `df.empty : break` after dedupe handles that case.
-    safety_cap = -(-limit // per_call_cap) + 5
+    safety_cap = -(-limit // page_size) + 5
 
     for _ in range(safety_cap):
-        raw = ex.fetch_ohlcv(symbol, timeframe, since=cursor, limit=per_call_cap)
+        raw = ex.fetch_ohlcv(symbol, timeframe, since=cursor, limit=page_size)
         if not raw:
             break
         df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -90,8 +103,8 @@ def fetch_candles(exchange_id: str, symbol: str, timeframe: str,
         seen.update(df["timestamp"].tolist())
         batches.append(df)
         # Two ways to stop: we've hit the head of history OR we've collected `limit` bars.
-        if len(raw) < per_call_cap:
-            break  # partial page = exchange has no more bars beyond this one
+        if len(raw) < page_size - 1:
+            break  # page two or more bars short = exchange has no more bars beyond this one
         if len(seen) >= limit:
             break  # we have what was asked for
         cursor = int(df["timestamp"].iloc[-1]) + tf_minutes * 60 * 1000
@@ -290,7 +303,7 @@ def run_replay(cfg: RuntimeConfig, args):
     # Compute how many bars `--hours` actually requires. The CLI default
     # `--limit 2000` is silently too small for `--hours 720` at 15m (which needs
     # 2880 bars); expand to cover the requested history with a small buffer. The
-    # expanded limit feeds the paginated fetcher — Binance's 1000-bar-per-call
+    # expanded limit feeds the paginated fetcher — the exchange's per-call
     # cap is handled internally by fetch_candles.
     needed_bars = int(args.hours * 60 / tf_minutes) + 100
     effective_limit = max(args.limit, needed_bars)
@@ -713,6 +726,167 @@ def run_check(cfg: RuntimeConfig, args) -> int:
 
 
 # --------------------------------------------------------------------------
+# Daily recap mode — one Telegram summary of the last N hours
+# --------------------------------------------------------------------------
+
+def _fmt_price(p: float) -> str:
+    """Exchange-style price formatting: thousands separators above 1000, more
+    decimals for sub-dollar pairs (DOGE etc.)."""
+    if p >= 1000:
+        return f"{p:,.2f}"
+    if p >= 1:
+        return f"{p:,.4f}"
+    return f"{p:.6f}"
+
+
+def _reconstruct_trades(events: list, cfg: IndicatorConfig):
+    """Walk time-ordered Events and rebuild closed trades + the still-open position.
+
+    Returns (trades, open_trade). Same model as the backtest: 1/3 of the position
+    per TP target, SL closes whatever remains, and a flip (opposite Entry) closes
+    the remainder at the new entry's price. Trade dicts carry entry_time/exit_time/
+    side/ret/reason/entry_price so callers can bucket them into a window.
+    """
+    tp_pcts = cfg.tp_levels_pct
+    sl_pct = cfg.sl_level_pct
+    trades = []
+    open_trade = None
+
+    def finish(exit_price, exit_time, reason):
+        nonlocal open_trade
+        t = open_trade
+        sign = 1.0 if t["side"] == "Long" else -1.0
+        ret = t.get("partial_ret", 0.0) + sign * (exit_price - t["entry"]) / t["entry"] * t["remaining"]
+        trades.append({
+            "entry_time": t["t0"], "exit_time": exit_time, "side": t["side"],
+            "ret": ret, "reason": reason, "entry_price": t["entry"],
+        })
+        open_trade = None
+
+    for e in events:
+        kind = e.kind
+        price = float(e.price)
+        if kind.endswith(" Entry"):
+            side = "Long" if kind.startswith("Long") else "Short"
+            if open_trade is not None:
+                finish(price, e.time, "flip")
+            open_trade = {"side": side, "entry": price, "remaining": 1.0,
+                          "tp_taken": 0, "partial_ret": 0.0, "t0": e.time}
+            continue
+        if open_trade is None or not kind.startswith(open_trade["side"]):
+            continue  # stray management event (e.g. SL-after-TP3 state quirk) — ignore
+        if "TP" in kind and open_trade["remaining"] > 1e-9:
+            idx = {"TP1": 0, "TP2": 1, "TP3": 2}[kind.split(" ")[1]]
+            gain = tp_pcts[idx] / 100.0 * (1.0 / 3.0)
+            open_trade["tp_taken"] += 1
+            open_trade["partial_ret"] += gain
+            open_trade["remaining"] -= 1.0 / 3.0
+            if open_trade["remaining"] <= 1e-9:
+                finish(price, e.time, "TP3")
+            continue
+        if "SL" in kind and open_trade["remaining"] > 1e-9:
+            open_trade["partial_ret"] += -(sl_pct / 100.0) * open_trade["remaining"]
+            open_trade["remaining"] = 0.0
+            finish(price, e.time, "SL")
+    return trades, open_trade
+
+
+def run_daily(cfg: RuntimeConfig, args) -> int:
+    """Send one Telegram recap of the last `--hours` (default 24): per pair, the
+    day's entry signals, closed-trade win rate and net %, and any still-open
+    position with its unrealized PnL. Recomputed from candles — no state file
+    needed. Always sends (the recap doubles as a daily liveness check); does NOT
+    respect quiet hours.
+    """
+    if not cfg.telegram_token or not cfg.telegram_chat_id:
+        raise SystemExit("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set for daily mode.")
+    tg = TelegramClient(cfg.telegram_token, cfg.telegram_chat_id)
+    hours = args.hours
+    start = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=hours)
+    dry_run = bool(args.dry_run)
+    tf_minutes = cfg.cfg.chart_timeframe_min
+    timeframe_str = minutes_to_timeframe(tf_minutes)
+
+    lines = []
+    grand_entries = grand_closed = grand_wins = 0
+    grand_net = 0.0
+    any_error = False
+
+    for pair in cfg.pairs:
+        symbol = pair.symbol
+        exchange_id = pair.exchange or cfg.exchange
+        try:
+            df = fetch_candles(exchange_id, symbol, timeframe_str, limit=1500)
+            if df.empty:
+                raise RuntimeError("no candles returned")
+            now_utc = pd.Timestamp.now(tz="UTC")
+            cutoff = now_utc - pd.Timedelta(minutes=tf_minutes) - pd.Timedelta(seconds=30)
+            df_closed = df[df.index <= cutoff]
+            events = run_indicator(df_closed, cfg.cfg, symbol=symbol)
+            trades, open_t = _reconstruct_trades(events, cfg.cfg)
+
+            entries = [e for e in events if e.kind.endswith(" Entry") and e.time >= start]
+            closed = [t for t in trades if t["exit_time"] >= start]
+            wins = sum(1 for t in closed if t["ret"] > 0)
+            net = sum(t["ret"] for t in closed) * 100.0
+            reasons = {}
+            for t in closed:
+                reasons[t["reason"]] = reasons.get(t["reason"], 0) + 1
+            longs = sum(1 for e in entries if e.kind.startswith("Long"))
+
+            grand_entries += len(entries)
+            grand_closed += len(closed)
+            grand_wins += wins
+            grand_net += net
+
+            if not entries and not closed and open_t is None:
+                lines.append(f"🔹 {symbol} — no signals")
+                continue
+
+            lines.append(f"🔹 {symbol}")
+            if entries:
+                lines.append(f"   Signals: {len(entries)} ({longs} Long, {len(entries) - longs} Short)")
+            else:
+                lines.append("   Signals: 0")
+            if closed:
+                wr = wins / len(closed) * 100.0
+                rstr = ", ".join(f"{k} {v}" for k, v in sorted(reasons.items()))
+                lines.append(f"   Closed: {len(closed)} · Win rate {wr:.0f}% · Net {net:+.1f}%   [{rstr}]")
+            else:
+                lines.append("   Closed: 0")
+            if open_t:
+                sign = 1.0 if open_t["side"] == "Long" else -1.0
+                last_close = float(df_closed["close"].iloc[-1])
+                unreal = sign * (last_close - open_t["entry"]) / open_t["entry"] * 100.0
+                lines.append(f"   Open: {open_t['side']} @ {_fmt_price(open_t['entry'])} "
+                             f"(since {open_t['t0'].strftime('%H:%M')} UTC, now {_fmt_price(last_close)}, {unreal:+.1f}%)")
+        except Exception:
+            log.exception("Daily %s: error — pair skipped.", symbol)
+            lines.append(f"🔹 {symbol} — ⚠️ error (see run logs)")
+            any_error = True
+
+    total_wr = (grand_wins / grand_closed * 100.0) if grand_closed else 0.0
+    now_str = pd.Timestamp.now(tz="UTC").strftime("%a %d %b, %H:%M UTC")
+    msg = [f"📊 SAIYAN daily recap — {now_str} (last {hours}h)", ""]
+    msg.extend(lines)
+    msg.append("")
+    msg.append("━━━━━━━━━━━━━━━━━━━━━")
+    msg.append(f"Total: {grand_entries} signals · {grand_closed} closed · "
+               f"win rate {total_wr:.0f}% · net {grand_net:+.1f}%")
+    text = "\n".join(msg)
+
+    log.info("Daily recap:\n%s", text)
+    if dry_run:
+        print(text)
+        return 1 if any_error else 0
+    if tg.send_message(text):
+        log.info("Sent daily recap to Telegram.")
+        return 1 if any_error else 0
+    tg_log.error("Failed to deliver daily recap.")
+    return 1
+
+
+# --------------------------------------------------------------------------
 # Entry
 # --------------------------------------------------------------------------
 
@@ -858,6 +1032,14 @@ def main():
                     help="Print would-be alerts instead of sending to Telegram; state still "
                          "advances (use for testing).")
 
+    pdaily = sub.add_parser("daily",
+        help="Send one Telegram recap of the last N hours: per-pair signals, closed-trade "
+             "win rate and net %, and open positions. Recomputed from candles — no state.")
+    pdaily.add_argument("--hours", type=int, default=24,
+                        help="Recap window in hours. Default: 24.")
+    pdaily.add_argument("--dry-run", action="store_true",
+                        help="Print the recap instead of sending to Telegram.")
+
     ps = sub.add_parser("summarize", help="Pretty-print kind histogram + stats for one replay CSV.")
     ps.add_argument("--input", required=True, help="Path to a replay CSV (e.g. replays/btc_replay.csv).")
     ps.add_argument("--json", action="store_true",
@@ -889,6 +1071,8 @@ def main():
         run_live(cfg, once=args.once, focus_pair=args.pair)
     elif args.cmd == "check":
         raise SystemExit(run_check(cfg, args))
+    elif args.cmd == "daily":
+        raise SystemExit(run_daily(cfg, args))
     elif args.cmd == "summarize":
         run_summarize(args)
     elif args.cmd == "test-fire":

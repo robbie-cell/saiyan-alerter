@@ -1,0 +1,40 @@
+# SAIYAN daily recap — one Telegram summary per day
+#
+# Runs `python main.py daily` which recomputes the last 24h from candles and
+# sends a single digestible recap: per-pair signals, closed-trade win rate and
+# net %, and open positions with unrealized PnL. Also doubles as a daily
+# liveness check — if you stop getting these, the bot is down.
+#
+# Time: 21:00 UTC. To change the hour, edit the cron below (GitHub schedules
+# are UTC). E.g. 21:00 local in London winter = "21 0 * * *" is wrong — just
+# convert your local hour to UTC and put it in the first field: "0 21 * * *".
+
+name: SAIYAN daily recap
+
+on:
+  schedule:
+    - cron: "0 21 * * *"   # 21:00 UTC daily — EDIT the hour here if you want a different time
+  workflow_dispatch: {}    # allow manual runs (e.g. to test)
+
+permissions:
+  contents: read
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Send daily recap
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py daily --hours 24
