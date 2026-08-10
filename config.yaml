@@ -1,7 +1,7 @@
 # runtime config for the SAIYAN OCC (XXX) Python port → Telegram alerter
 # Default exchange: `gate` (Gate.io). Binance geo-blocks GitHub Actions runner
 # IPs with HTTP 451 ("restricted location"), so the cron deployment cannot read
-# Binance candles; Gate.io has no such block and lists all four pairs below
+# Binance candles; Gate.io has no such block and lists all pairs below
 # (incl. PAXG/USDT). To run locally against Binance instead, set `exchange: binance`
 # — the cron copy of this file must keep `gate` to work.
 exchange: gate
@@ -23,7 +23,10 @@ pairs:
   - BTC/USDT
   - ETH/USDT
   - SOL/USDT
-  - PAXG/USDT
+  - PAXG/USDT          # gold proxy
+  - XRP/USDT
+  - BNB/USDT
+  - DOGE/USDT
 
 indicator:
   ma_type: ALMA
