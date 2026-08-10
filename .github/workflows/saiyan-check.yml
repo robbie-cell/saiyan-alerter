@@ -14,6 +14,11 @@
 # (If this repo is ever made PRIVATE again: the free tier caps private repos at
 # 2,000 Actions minutes/month and rounds each job up to a whole minute, so the
 # cadence must go back to 30 minutes — "5,35 * * * *" — or jobs silently stop.)
+#
+# NOTE (2026-08-10): GitHub does not always activate a `schedule` trigger on a
+# brand-new repo until a fresh push to the default branch re-evaluates it. If
+# scheduled runs stop appearing in the Actions tab, push any trivial change to
+# `main` to re-arm the schedule.
 
 name: SAIYAN alerter check
 
