@@ -52,16 +52,20 @@ jobs:
         run: pip install -r requirements.txt
 
       # The bot needs the previous run's state file (which bars it already
-      # reported per pair). The previous run must be SUCCESSFUL, since a
-      # successful run always uploads the state artifact. The very first run
-      # has no predecessor — the download step is skipped and the bot baselines
-      # on the most recent closed bar without replaying old signals.
+      # reported per pair). The very first run has no predecessor — the
+      # download step is skipped and the bot baselines on the most recent
+      # closed bar without replaying old signals.
       - name: Find previous successful run
         id: prev
         env:
           GH_TOKEN: ${{ github.token }}
+        # IMPORTANT: filter to THIS workflow (saiyan-check.yml). Without the
+        # workflow= filter, the most recent successful run can be the daily
+        # recap (saiyan-daily.yml), which uploads no state artifact — the
+        # download would fail and the bot would re-baseline (losing dedupe
+        # continuity and re-sending the startup message).
         run: |
-          RUN_ID=$(gh api "repos/${{ github.repository }}/actions/runs?status=success&per_page=1" --jq '.workflow_runs[0].id // empty')
+          RUN_ID=$(gh api "repos/${{ github.repository }}/actions/runs?workflow=saiyan-check.yml&status=success&per_page=1" --jq '.workflow_runs[0].id // empty')
           echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
 
       - name: Download previous state
