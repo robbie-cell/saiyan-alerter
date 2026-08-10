@@ -56,6 +56,20 @@ def fetch_candles(exchange_id: str, symbol: str, timeframe: str,
     per_call_cap = min(limit, 1000)
     tf_minutes = timeframe_to_minutes(timeframe)
 
+    if since_ms is None:
+        # Most-recent-bars query: one page (up to 1000 bars ≈ 10+ days at 15m) is
+        # far more than the indicator's warmup needs (~50 bars). Deliberately do
+        # NOT paginate forward from here — the next cursor would lie in the
+        # future, which Binance tolerates (empty page) but Gate.io rejects with
+        # INVALID_PARAM_VALUE "invalid time range".
+        raw = ex.fetch_ohlcv(symbol, timeframe, since=None, limit=per_call_cap)
+        if not raw:
+            empty = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+            return empty.set_index("timestamp")
+        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        return df.drop_duplicates(subset="timestamp").set_index("timestamp").sort_index()
+
     seen: set = set()
     batches: list = []
     cursor = since_ms

@@ -1,5 +1,10 @@
 # runtime config for the SAIYAN OCC (XXX) Python port → Telegram alerter
-exchange: binance
+# Default exchange: `gate` (Gate.io). Binance geo-blocks GitHub Actions runner
+# IPs with HTTP 451 ("restricted location"), so the cron deployment cannot read
+# Binance candles; Gate.io has no such block and lists all four pairs below
+# (incl. PAXG/USDT). To run locally against Binance instead, set `exchange: binance`
+# — the cron copy of this file must keep `gate` to work.
+exchange: gate
 
 # Pairs accept either a plain 'BASE/QUOTE' string (uses the default exchange)
 # or a dict with optional `exchange:` dict fields (cross-exchange setups,
@@ -7,12 +12,11 @@ exchange: binance
 # Note on `XAU/USD`: Bitfinex and MEXC both raise `BadSymbol` on XAU/USD via
 # ccxt's public OHLCV endpoint (commodity-bearing exchanges generally don't
 # carry a native XAU/USD spot symbol through that route). `PAXG/USDT`
-# (Paxos Gold — 1 troy oz per token, tracks XAU/USD within ~0.10%) on Binance
-# is the working substitute and uses the same ccxt exchange as the crypto
-# pairs above.
+# (Paxos Gold — 1 troy oz per token, tracks XAU/USD within ~0.10%) is the
+# working substitute and uses the same ccxt exchange as the crypto pairs above.
 #   pairs:
 #     - BTC/USDT
-#     - PAXG/USDT                                  # gold proxy on Binance
+#     - PAXG/USDT                                  # gold proxy
 #     - {symbol: XAU/USDT, exchange: mexc}         # if mexc ever exposes XAU/USDT via ccxt
 # The dict form supports as many `symbol`/`exchange` overrides as needed.
 pairs:
