@@ -1,0 +1,46 @@
+# runtime config for the SAIYAN OCC (XXX) Python port → Telegram alerter
+exchange: binance
+
+# Pairs accept either a plain 'BASE/QUOTE' string (uses the default exchange)
+# or a dict with optional `exchange:` dict fields (cross-exchange setups,
+# custom timeframes/indicators — reserved for future work).
+# Note on `XAU/USD`: Bitfinex and MEXC both raise `BadSymbol` on XAU/USD via
+# ccxt's public OHLCV endpoint (commodity-bearing exchanges generally don't
+# carry a native XAU/USD spot symbol through that route). `PAXG/USDT`
+# (Paxos Gold — 1 troy oz per token, tracks XAU/USD within ~0.10%) on Binance
+# is the working substitute and uses the same ccxt exchange as the crypto
+# pairs above.
+#   pairs:
+#     - BTC/USDT
+#     - PAXG/USDT                                  # gold proxy on Binance
+#     - {symbol: XAU/USDT, exchange: mexc}         # if mexc ever exposes XAU/USDT via ccxt
+# The dict form supports as many `symbol`/`exchange` overrides as needed.
+pairs:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - PAXG/USDT
+
+indicator:
+  ma_type: ALMA
+  basis_len: 2
+  offset_sigma: 5          # sigma for ALMA; offset for LSMA
+  offset_alma: 0.85
+  use_res: true
+  intres_multiplier: 8     # HTF = chart_timeframe_min * intres_multiplier  (15m * 8 = 2h)
+  chart_timeframe_min: 15  # 15-minute candles on the LTF
+  delay_offset: 0
+  heikin_ashi: false
+  tp_levels_pct: [1.0, 1.5, 2.0]
+  sl_level_pct: 0.5
+  trade_type: BOTH         # LONG / SHORT / BOTH / NONE
+
+# dedupe ignores repeat (symbol, kind) signals within this many minutes
+dedupe_minutes: 5
+
+# Telegram quiet hours (null OR [start_hour, end_hour] in 24h local time).
+# Set to null to send 24/7.
+quiet_hours: null
+
+# Time zone used for quiet-hours comparison and event timestamps
+timezone: UTC

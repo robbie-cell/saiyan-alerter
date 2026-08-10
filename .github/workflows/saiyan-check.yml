@@ -1,0 +1,84 @@
+# SAIYAN alerter — scheduled signal scan (GitHub Actions cron)
+#
+# Runs `main.py check` every 30 minutes. Each run fetches trailing candles,
+# recomputes the indicator, and sends only events on bars closed since the last
+# run (per-pair progress is carried between runs via the `saiyan-state` artifact).
+#
+# Why 30 minutes (not 15): GitHub's free plan gives PRIVATE repos 2,000 Actions
+# minutes/month and rounds every job up to a whole minute, so a 15-min cadence
+# (2,880 jobs/mo) would exceed the cap and silently stop the bot. At 30 min the
+# job uses ~1,440 min/mo with headroom. Because `check` processes EVERY candle
+# closed since the last run, no signal is ever dropped — delayed or skipped runs
+# are simply caught up on the next successful run. Signals arrive up to 30 min
+# late (avg 15). If the repo is public (unlimited minutes), you can tighten the
+# cadence to ~5-min-late delivery with:  "1,16,31,46 * * * *"
+
+name: SAIYAN alerter check
+
+on:
+  schedule:
+    - cron: "5,35 * * * *"   # :05 and :35 past each hour, UTC
+  workflow_dispatch: {}      # allow manual runs (use for the first baseline)
+
+# Serialize runs: a queued run waits for the one in flight, so two runs can
+# never read the same state and double-send.
+concurrency:
+  group: saiyan-check
+  cancel-in-progress: false
+
+permissions:
+  actions: read    # list previous runs + download their state artifact
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # The bot needs the previous run's state file (which bars it already
+      # reported per pair). The previous run must be SUCCESSFUL, since a
+      # successful run always uploads the state artifact. The very first run
+      # has no predecessor — the download step is skipped and the bot baselines
+      # on the most recent closed bar without replaying old signals.
+      - name: Find previous successful run
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID=$(gh api "repos/${{ github.repository }}/actions/runs?status=success&per_page=1" --jq '.workflow_runs[0].id // empty')
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Download previous state
+        if: steps.prev.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: saiyan-state
+          path: state
+          run-id: ${{ steps.prev.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true   # no artifact yet (first run) is fine
+
+      - name: Scan closed candles and send new signals
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        # Exit 1 (job goes red) if any pair failed — the next scheduled run
+        # retries those pairs. State for successful pairs is already advanced,
+        # so nothing is re-sent.
+        run: python main.py check --state state/saiyan_state.json
+
+      - name: Upload state for the next run
+        uses: actions/upload-artifact@v4
+        with:
+          name: saiyan-state
+          path: state/saiyan_state.json
+          if-no-files-found: error
