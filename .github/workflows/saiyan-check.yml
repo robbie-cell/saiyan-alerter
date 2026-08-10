@@ -1,23 +1,25 @@
 # SAIYAN alerter — scheduled signal scan (GitHub Actions cron)
 #
-# Runs `main.py check` every 30 minutes. Each run fetches trailing candles,
+# Runs `main.py check` every 5 minutes. Each run fetches trailing candles,
 # recomputes the indicator, and sends only events on bars closed since the last
 # run (per-pair progress is carried between runs via the `saiyan-state` artifact).
 #
-# Why 30 minutes (not 15): GitHub's free plan gives PRIVATE repos 2,000 Actions
-# minutes/month and rounds every job up to a whole minute, so a 15-min cadence
-# (2,880 jobs/mo) would exceed the cap and silently stop the bot. At 30 min the
-# job uses ~1,440 min/mo with headroom. Because `check` processes EVERY candle
-# closed since the last run, no signal is ever dropped — delayed or skipped runs
-# are simply caught up on the next successful run. Signals arrive up to 30 min
-# late (avg 15). If the repo is public (unlimited minutes), you can tighten the
-# cadence to ~5-min-late delivery with:  "1,16,31,46 * * * *"
+# Cadence: this repo is PUBLIC, so Actions minutes are unlimited and a 5-minute
+# schedule is free. Runs are offset 1 minute past each 5-minute boundary
+# (:01, :06, :11, …) so a 15m candle closing at :00/:15/:30/:45 UTC is picked up
+# ~1-6 minutes after it closes (GitHub schedules can lag a few minutes). Because
+# `check` processes EVERY candle closed since the last run, a delayed or skipped
+# run never loses a signal — it simply catches up on the next run.
+#
+# (If this repo is ever made PRIVATE again: the free tier caps private repos at
+# 2,000 Actions minutes/month and rounds each job up to a whole minute, so the
+# cadence must go back to 30 minutes — "5,35 * * * *" — or jobs silently stop.)
 
 name: SAIYAN alerter check
 
 on:
   schedule:
-    - cron: "5,35 * * * *"   # :05 and :35 past each hour, UTC
+    - cron: "1,6,11,16,21,26,31,36,41,46,51,56 * * * *"   # every 5 min, :01 offset, UTC
   workflow_dispatch: {}      # allow manual runs (use for the first baseline)
 
 # Serialize runs: a queued run waits for the one in flight, so two runs can
