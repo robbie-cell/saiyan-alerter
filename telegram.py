@@ -128,14 +128,15 @@ _BADGE = {
 
 
 def _fmt_price(p: float) -> str:
-    """Adaptive precision based on magnitude — crypto pairs vary widely."""
+    """Adaptive precision with thousands separators — mirrors the daily recap's
+    formatter so alerts and recaps show identical price strings (e.g. BTC
+    "64,045.70" rather than "64045.70")."""
     if not isinstance(p, float):
         return str(p)
     a = abs(p)
-    if a >= 1000: return f"{p:.2f}"
-    if a >= 10:   return f"{p:.4f}"
-    if a >= 0.1:  return f"{p:.5f}"
-    return f"{p:.8f}"
+    if a >= 1000: return f"{p:,.2f}"
+    if a >= 1:    return f"{p:,.4f}"
+    return f"{p:.6f}"
 
 
 def format_event(event, tz_name: str = "UTC") -> str:
@@ -178,10 +179,11 @@ def format_event(event, tz_name: str = "UTC") -> str:
 
     if event.plan is not None:
         is_entry = event.kind.endswith(" Entry")
-        # Reference price for % calculation: entry events have price == entry_price,
-        # so entries should never show "Entry: X (+Y%)" against itself; cross events
-        # show distance from current bar price.
-        reference_price = event.plan.entry_price if is_entry else event.price
+        # Plan percentages are always relative to the ENTRY price, so the plan
+        # block reads identically on every alert (a TP1 shown as +1.00% on the
+        # entry alert is still +1.00% when the TP1 alert arrives — never a
+        # confusing +0.00% against the just-filled level).
+        entry = event.plan.entry_price
         # Side sign flips the signed-pct calculation: Long targets above entry, Short
         # targets below. Apply * side_sign so the displayed % always reads "+X%" when
         # the target is in trade direction (good) and "-X%" against (bad).
@@ -191,8 +193,8 @@ def format_event(event, tz_name: str = "UTC") -> str:
         lines.append("Plan:")
         if not is_entry:
             # Cross events: show where the entry sat relative to current price.
-            entry_pct = (event.plan.entry_price - reference_price) / reference_price * 100 * side_sign
-            lines.append(f"  Entry:  {_fmt_price(event.plan.entry_price):>10}   ({entry_pct:+.2f}%)")
+            entry_pct = (entry - event.price) / event.price * 100 * side_sign
+            lines.append(f"  Entry   {_fmt_price(entry):>12}   ({entry_pct:+.2f}%)")
         # `event.filled` is populated by run_indicator as a frozenset of TP targets
         # already hit BEFORE this event was emitted. Entry events have empty; TP
         # events include the just-filled target; SL events reflect prior fills so
@@ -202,8 +204,8 @@ def format_event(event, tz_name: str = "UTC") -> str:
                              ("TP2", event.plan.tp2),
                              ("TP3", event.plan.tp3),
                              ("SL",  event.plan.sl)]:
-            pct = (level - reference_price) / reference_price * 100 * side_sign
+            pct = (level - entry) / entry * 100 * side_sign
             mark = "✓" if label in event.filled else " "
-            lines.append(f"  {mark} {label:<6} {_fmt_price(level):>10}   ({pct:+.2f}%)")
+            lines.append(f"  {mark} {label:<4} {_fmt_price(level):>12}   ({pct:+.2f}%)")
 
     return "\n".join(lines)

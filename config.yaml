@@ -59,31 +59,7 @@ quiet_hours: null
 timezone: Australia/Melbourne
 
 # ---------------------------------------------------------------------------
-# Automatic execution (safety-first; `off` is the default and trades nothing)
-#
-#   mode: off | paper | testnet | live
-#     off      alerts only — nothing trades
-#     paper    internal simulation, no API keys, no money; fills match the
-#              backtest reconstruction exactly (use this to validate)
-#     testnet  real orders on Gate's testnet (api-testnet.gateapi.io) via
-#              GATE_API_KEY / GATE_API_SECRET in .env
-#     live     REAL MONEY on Gate mainnet — requires live_confirmation: true
-#
-# Admin commands in Telegram (active only when mode != off): /status /recap [N]
-# /balance /stop /resume /flat /help
-# Rails: size_usdt caps notional per entry; max_positions caps open positions;
-# daily_loss_limit_usd halts NEW entries for the UTC day after realized losses
-# exceed it (auto-lifts at midnight, or /resume); quiet_pause stops trading
-# during quiet_hours; starting_balance_usdt is display-only (equity baseline
-# shown by /balance — paper accounts only, no effect on trading).
+# Automatic execution has been REMOVED — this bot is alerts-only.
+# The executor code still lives in the repo (executor.py) for a potential
+# future phase; see git history for how it was wired up.
 # ---------------------------------------------------------------------------
-execution:
-  mode: "off"          # off | paper | testnet | live — off = alerts only, nothing trades
-                       # (quoted: PyYAML would parse the bare word `off` as a boolean)
-  size_usdt: 200       # notional per entry (top-3 @ $200 was the best $600-account
-                       # setup from compare_portfolios.py; only used when mode != off)
-  max_positions: 3     # concurrent open positions (flips always allowed)
-  daily_loss_limit_usd: 50
-  quiet_pause: true    # don't open/close during quiet_hours
-  live_confirmation: false
-  starting_balance_usdt: 600   # /balance equity baseline (paper display only)
