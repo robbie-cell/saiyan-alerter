@@ -26,6 +26,7 @@ import ccxt
 import pandas as pd
 
 from config import PairConfig, RuntimeConfig, load_config
+from executor import make_executor
 from indicator import Event, IndicatorConfig, Plan, run_indicator
 from telegram import TelegramClient, format_event, log as tg_log
 
@@ -462,11 +463,19 @@ def run_summarize(args) -> None:
 # --------------------------------------------------------------------------
 
 def _process_symbol(cfg: RuntimeConfig, pair: PairConfig, tg: TelegramClient, dedupe: Dedupe,
-                    quiet: QuietHours) -> list:
+                    quiet: QuietHours, executor=None) -> tuple:
     """Fetch trailing candles for `pair.symbol` from `pair.exchange` (or the
     default exchange when `pair.exchange is None`), run the indicator, return
     NEW events (those whose time is on the most recently CLOSED bar). Closed =
-    bar timestamp is at least one `chart_timeframe_min` + 30s grace in the past."""
+    bar timestamp is at least one `chart_timeframe_min` + 30s grace in the past.
+
+    Returns (sent, last_close): `sent` is the list of events delivered to
+    Telegram; `last_close` is the latest closed-bar close price (None when no
+    data) — the live loop uses it for execution monitoring.
+
+    When `executor` is set, raw new events are fed to it for automatic
+    execution (before Telegram dedupe, so execution follows the indicator 1:1).
+    Quiet hours suppress execution unless execution.quiet_pause is false."""
     exchange_id = pair.exchange or cfg.exchange
     symbol = pair.symbol
     tf_minutes = cfg.cfg.chart_timeframe_min
@@ -486,8 +495,16 @@ def _process_symbol(cfg: RuntimeConfig, pair: PairConfig, tg: TelegramClient, de
     events = run_indicator(df_closed, cfg.cfg, symbol=symbol)
     last_bar_time = df_closed.index[-1]
     new_events = [e for e in events if e.time == last_bar_time]
+    last_close = float(df_closed["close"].iloc[-1])
     if quiet.is_quiet():
-        return []
+        if executor is not None and not executor.cfg.quiet_pause:
+            executor.process_events(new_events, tg)
+        return [], last_close
+    if executor is not None:
+        try:
+            executor.process_events(new_events, tg)
+        except Exception as e:
+            log.exception("Executor error on %s: %s", symbol, e)
     sent = []
     for e in new_events:
         if not dedupe.ok(e):
@@ -499,7 +516,7 @@ def _process_symbol(cfg: RuntimeConfig, pair: PairConfig, tg: TelegramClient, de
             sent.append(e)
         else:
             tg_log.error("Failed to deliver event: %s", msg)
-    return sent
+    return sent, last_close
 
 
 def _send_startup_message(tg: TelegramClient, cfg: RuntimeConfig, focus: Optional[PairConfig]) -> None:
@@ -541,6 +558,10 @@ def run_live(cfg: RuntimeConfig, once: bool = False, focus_pair: Optional[str] =
     quiet = QuietHours(cfg.quiet_hours, cfg.timezone)
     health = PairHealth()
 
+    # Automatic execution (paper/testnet/live). `off` (default) = alerts only.
+    executor = make_executor(cfg.execution, Path("execution_state.json")) \
+        if cfg.execution and cfg.execution.mode != "off" else None
+
     # Hugging Face Spaces: keep-alive + platform health checks need an HTTP
     # endpoint on $PORT (7860). Pings reset the 48h-inactivity sleep timer, so
     # the Space stays awake 24/7. No-op unless HF_SPACE=1 (set in the Space's
@@ -571,34 +592,49 @@ def run_live(cfg: RuntimeConfig, once: bool = False, focus_pair: Optional[str] =
     # that focus and its per-pair exchange override, not the full registry.
     startup_focus = pairs[0] if len(pairs) == 1 else None
     _send_startup_message(tg, cfg, focus=startup_focus)
+    if executor is not None:
+        tg.send_message(executor.status())  # shows mode + rails + open positions
 
     if once:
         total = 0
         for pair in pairs:
             try:
-                total += len(_process_symbol(cfg, pair, tg, dedupe, quiet))
+                sent, _last_close = _process_symbol(cfg, pair, tg, dedupe, quiet,
+                                                    executor=executor)
+                total += len(sent)
                 health.record_success(pair.symbol)
             except Exception as e:
                 if health.should_log_error(pair.symbol, pd.Timestamp.now(tz="UTC")):
                     log.exception("Error processing %s: %s", pair.symbol, e)
         log.info("Live (once): sent %d alerts.", total)
+        if executor is not None:
+            executor.save()
         return
 
     tf_minutes = cfg.cfg.chart_timeframe_min
     tick_seconds = 5 if tf_minutes < 60 else 30
     log.info("Live loop starting: %d pairs, %s candles, %ds tick.",
              len(pairs), minutes_to_timeframe(tf_minutes), tick_seconds)
+    prices: dict = {}
     while True:
         start = time_mod.time()
         try:
             for pair in pairs:
                 try:
-                    _process_symbol(cfg, pair, tg, dedupe, quiet)
+                    _sent, last_close = _process_symbol(cfg, pair, tg, dedupe, quiet,
+                                                        executor=executor)
+                    if last_close is not None:
+                        prices[pair.symbol] = last_close
                     health.record_success(pair.symbol)
                 except Exception as e:
                     now = pd.Timestamp.now(tz="UTC")
                     if health.should_log_error(pair.symbol, now):
                         log.exception("Error processing %s: %s", pair.symbol, e)
+            if executor is not None:
+                try:
+                    executor.tick(prices, tg)   # TP/SL monitor + admin commands
+                except Exception as e:
+                    log.exception("Executor tick error: %s", e)
         except Exception as e:
             log.exception("Outer loop error: %s", e)
         elapsed = time_mod.time() - start

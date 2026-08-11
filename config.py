@@ -30,6 +30,25 @@ class PairConfig:
 
 
 @dataclass
+class ExecutionConfig:
+    """Automatic execution settings (config.yaml `execution:` block).
+
+    mode: off | paper | testnet | live. `off` = alerts only. `paper` = internal
+    simulation (no keys, no money). `testnet` = real orders on Gate's testnet
+    (needs GATE_API_KEY/GATE_API_SECRET). `live` = REAL MONEY and requires
+    `live_confirmation: true`.
+    """
+    mode: str = "off"
+    size_usdt: float = 25.0
+    max_positions: int = 3
+    daily_loss_limit_usd: float = 50.0
+    quiet_pause: bool = True   # don't trade during quiet_hours
+    live_confirmation: bool = False
+    tp_levels_pct: Tuple[float, float, float] = (1.0, 1.5, 2.0)  # set from indicator block
+    sl_level_pct: float = 0.5
+
+
+@dataclass
 class RuntimeConfig:
     pairs: list  # list[PairConfig]
     exchange: str
@@ -39,6 +58,7 @@ class RuntimeConfig:
     dedupe_minutes: int = 5
     quiet_hours: Optional[Tuple[int, int]] = None  # (start_hour, end_hour) local
     timezone: str = "UTC"
+    execution: Optional[ExecutionConfig] = None
 
 
 def _load_yaml(path: Path) -> dict:
@@ -108,6 +128,21 @@ def load_config(path: Path = DEFAULT_CFG_PATH) -> RuntimeConfig:
             raise ValueError("`quiet_hours` must be null or [start_hour, end_hour] (24h local time).")
         quiet_hours = (int(quiet_hours[0]), int(quiet_hours[1]))
 
+    ex = raw.get("execution") or {}
+    mode = str(ex.get("mode", "off")).lower()
+    if mode not in ("off", "paper", "testnet", "live"):
+        raise ValueError("`execution.mode` must be one of off|paper|testnet|live.")
+    execution = ExecutionConfig(
+        mode=mode,
+        size_usdt=float(ex.get("size_usdt", 25.0)),
+        max_positions=int(ex.get("max_positions", 3)),
+        daily_loss_limit_usd=float(ex.get("daily_loss_limit_usd", 50.0)),
+        quiet_pause=bool(ex.get("quiet_pause", True)),
+        live_confirmation=bool(ex.get("live_confirmation", False)),
+    )
+    execution.tp_levels_pct = cfg.tp_levels_pct
+    execution.sl_level_pct = cfg.sl_level_pct
+
     return RuntimeConfig(
         pairs=pairs,
         exchange=exchange,
@@ -117,4 +152,5 @@ def load_config(path: Path = DEFAULT_CFG_PATH) -> RuntimeConfig:
         dedupe_minutes=int(raw.get("dedupe_minutes", 5)),
         quiet_hours=quiet_hours,
         timezone=str(raw.get("timezone", "UTC")),
+        execution=execution,
     )

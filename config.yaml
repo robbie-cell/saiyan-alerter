@@ -52,3 +52,28 @@ quiet_hours: null
 # Time zone used for quiet-hours comparison and Telegram event timestamps.
 # IANA name; e.g. Australia/Melbourne (AEST in winter, AEDT in summer).
 timezone: Australia/Melbourne
+
+# ---------------------------------------------------------------------------
+# Automatic execution (safety-first; `off` is the default and trades nothing)
+#
+#   mode: off | paper | testnet | live
+#     off      alerts only — nothing trades
+#     paper    internal simulation, no API keys, no money; fills match the
+#              backtest reconstruction exactly (use this to validate)
+#     testnet  real orders on Gate's testnet (api-testnet.gateapi.io) via
+#              GATE_API_KEY / GATE_API_SECRET in .env
+#     live     REAL MONEY on Gate mainnet — requires live_confirmation: true
+#
+# Admin commands in Telegram: /status /stop /resume /flat
+# Rails: size_usdt caps notional per entry; max_positions caps open positions;
+# daily_loss_limit_usd halts NEW entries for the UTC day after realized losses
+# exceed it (auto-lifts at midnight, or /resume); quiet_pause stops trading
+# during quiet_hours.
+# ---------------------------------------------------------------------------
+execution:
+  mode: paper          # off | paper | testnet | live
+  size_usdt: 25        # notional per entry
+  max_positions: 3     # concurrent open positions (flips always allowed)
+  daily_loss_limit_usd: 50
+  quiet_pause: true    # don't open/close during quiet_hours
+  live_confirmation: false

@@ -30,6 +30,29 @@ class TelegramClient:
         self.bot_username: Optional[str] = None
         self._fetch_bot_username()
 
+    def fetch_updates(self, offset: Optional[int] = None,
+                      timeout: float = 2.0) -> list:
+        """Long-poll getUpdates; returns raw update dicts (empty list on any error).
+
+        Used by the live loop to receive admin commands (/status, /stop, …).
+        `offset` is exclusive-acked: pass the previous update_id + 1 so already
+        consumed updates are never re-delivered.
+        """
+        url = f"{self.BASE}/bot{self.bot_token}/getUpdates"
+        params = {"timeout": int(max(1, min(timeout, 50))), "allowed_updates": ["message"]}
+        if offset:
+            params["offset"] = offset
+        try:
+            r = requests.get(url, params=params, timeout=timeout + 5)
+            if not r.ok:
+                log.debug("getUpdates HTTP %s: %s", r.status_code, r.text[:200])
+                return []
+            payload = r.json()
+            return payload.get("result") or [] if payload.get("ok") else []
+        except requests.RequestException as exc:
+            log.debug("getUpdates failed: %s", exc)
+            return []
+
     def _fetch_bot_username(self) -> None:
         """One-shot getMe at startup to learn our @username for clearer error messages."""
         url = f"{self.BASE}/bot{self.bot_token}/getMe"
