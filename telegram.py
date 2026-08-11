@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -114,8 +115,12 @@ def _fmt_price(p: float) -> str:
     return f"{p:.8f}"
 
 
-def format_event(event) -> str:
+def format_event(event, tz_name: str = "UTC") -> str:
     """Format an Event into a plain-text Telegram message (no Markdown escaping).
+
+    `tz_name` (default "UTC") controls the display timezone of the `Time:` line;
+    a best-effort tz abbreviation (e.g. AEST/AEDT) is appended when available.
+    Falls back to UTC if the timezone name is invalid.
 
     When `event.plan is not None`, appends a `Plan:` block listing entry price + the
     three TP targets + the SL price. Percentage is relative to the reference price:
@@ -126,10 +131,22 @@ def format_event(event) -> str:
     indicator's TP/SL math.
     """
     badge = _BADGE.get(event.kind, f"⚪ {event.kind}")
+    # Display time in the configured timezone (best effort; UTC on any error).
+    try:
+        local = event.time
+        if local.tzinfo is None:
+            local = local.tz_localize("UTC")
+        local = local.tz_convert(ZoneInfo(tz_name))
+        tz_label = local.tzname() or ""
+    except Exception:
+        local, tz_label = event.time, ""
+    time_line = f"Time:   {local.strftime('%Y-%m-%d %H:%M:%S')}"
+    if tz_label:
+        time_line += f" {tz_label}"
     lines = [
         f"{badge}",
         f"Pair:   {event.symbol}",
-        f"Time:   {event.time.strftime('%Y-%m-%d %H:%M:%S')}",
+        time_line,
         f"Price:  {_fmt_price(event.price)}",
     ]
     if event.level is not None and not (isinstance(event.level, float) and event.level != event.level):

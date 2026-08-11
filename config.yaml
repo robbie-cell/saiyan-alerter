@@ -49,5 +49,6 @@ dedupe_minutes: 5
 # Set to null to send 24/7.
 quiet_hours: null
 
-# Time zone used for quiet-hours comparison and event timestamps
-timezone: UTC
+# Time zone used for quiet-hours comparison and Telegram event timestamps.
+# IANA name; e.g. Australia/Melbourne (AEST in winter, AEDT in summer).
+timezone: Australia/Melbourne

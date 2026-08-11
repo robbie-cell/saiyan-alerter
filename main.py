@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import time as time_mod
+import zoneinfo
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,17 @@ from indicator import Event, IndicatorConfig, Plan, run_indicator
 from telegram import TelegramClient, format_event, log as tg_log
 
 log = logging.getLogger(__name__)
+
+
+def _local_ts(ts, tz_name: str = "UTC"):
+    """Convert a pandas Timestamp to a display timezone; UTC on any error."""
+    try:
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.tz_convert(tz)
 
 
 # --------------------------------------------------------------------------
@@ -480,7 +492,7 @@ def _process_symbol(cfg: RuntimeConfig, pair: PairConfig, tg: TelegramClient, de
     for e in new_events:
         if not dedupe.ok(e):
             continue
-        msg = format_event(e)
+        msg = format_event(e, cfg.timezone)
         log.info("alert: %s", msg, extra={"symbol": symbol, "exchange": exchange_id})
         if tg.send_message(msg):
             dedupe.mark(e)
@@ -693,7 +705,7 @@ def run_check(cfg: RuntimeConfig, args) -> int:
             elif new_events:
                 ok = True
                 for e in new_events:
-                    msg = format_event(e)
+                    msg = format_event(e, cfg.timezone)
                     if dry_run:
                         log.info("Check %s (dry-run) would send: %s", symbol, msg)
                         continue
@@ -858,15 +870,19 @@ def run_daily(cfg: RuntimeConfig, args) -> int:
                 sign = 1.0 if open_t["side"] == "Long" else -1.0
                 last_close = float(df_closed["close"].iloc[-1])
                 unreal = sign * (last_close - open_t["entry"]) / open_t["entry"] * 100.0
+                t0_local = _local_ts(open_t["t0"], cfg.timezone)
+                t0_label = t0_local.tzname() or ""
                 lines.append(f"   Open: {open_t['side']} @ {_fmt_price(open_t['entry'])} "
-                             f"(since {open_t['t0'].strftime('%H:%M')} UTC, now {_fmt_price(last_close)}, {unreal:+.1f}%)")
+                             f"(since {t0_local.strftime('%H:%M')} {t0_label}, now {_fmt_price(last_close)}, {unreal:+.1f}%)")
         except Exception:
             log.exception("Daily %s: error — pair skipped.", symbol)
             lines.append(f"🔹 {symbol} — ⚠️ error (see run logs)")
             any_error = True
 
     total_wr = (grand_wins / grand_closed * 100.0) if grand_closed else 0.0
-    now_str = pd.Timestamp.now(tz="UTC").strftime("%a %d %b, %H:%M UTC")
+    now_local = _local_ts(pd.Timestamp.now(tz="UTC"), cfg.timezone)
+    now_label = now_local.tzname() or ""
+    now_str = f"{now_local.strftime('%a %d %b, %H:%M')} {now_label}"
     msg = [f"📊 SAIYAN daily recap — {now_str} (last {hours}h)", ""]
     msg.extend(lines)
     msg.append("")
@@ -985,7 +1001,7 @@ def run_test_fire(cfg: RuntimeConfig, args) -> None:
         plan=plan,
         filled=_FILLED_BY_KIND[kind],
     )
-    msg = format_event(e)
+    msg = format_event(e, cfg.timezone)
     print("--- Synthesized event ---")
     print(msg)
     print("--- Sending to Telegram ---")
