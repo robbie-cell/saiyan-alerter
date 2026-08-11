@@ -5,15 +5,16 @@
 # net %, and open positions with unrealized PnL. Also doubles as a daily
 # liveness check — if you stop getting these, the bot is down.
 #
-# Time: 21:00 UTC. To change the hour, edit the cron below (GitHub schedules
-# are UTC). E.g. 21:00 local in London winter = "21 0 * * *" is wrong — just
-# convert your local hour to UTC and put it in the first field: "0 21 * * *".
+# Time: 23:59 Melbourne (AEST = UTC+10) → 13:59 UTC. To change the hour, edit
+# the cron below (GitHub schedules are UTC): convert your local hour to UTC.
+# NOTE (DST): when Melbourne switches to AEDT (UTC+11, Oct→Apr) this fires at
+# 00:59 local; set the cron to "59 12 * * *" during that window to keep 23:59.
 
 name: SAIYAN daily recap
 
 on:
   schedule:
-    - cron: "0 21 * * *"   # 21:00 UTC daily — EDIT the hour here if you want a different time
+    - cron: "59 13 * * *"   # 23:59 Melbourne (AEST) = 13:59 UTC
   workflow_dispatch: {}    # allow manual runs (e.g. to test)
 
 permissions:
