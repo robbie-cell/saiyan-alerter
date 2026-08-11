@@ -19,14 +19,19 @@ exchange: gate
 #     - PAXG/USDT                                  # gold proxy
 #     - {symbol: XAU/USDT, exchange: mexc}         # if mexc ever exposes XAU/USDT via ccxt
 # The dict form supports as many `symbol`/`exchange` overrides as needed.
+# Portfolio: trimmed to the 3 best markets from the 90-day backtest ranking
+# (rank_markets.py) — the top-3 beat all-7 on a single $600 account at
+# budget-matched sizes (+202% vs +164% in compare_portfolios.py) with ~57%
+# fewer Telegram messages. Order = ranking (best first).
+#
+# To add a pair back, just append it here — the bot picks it up on the next
+# run. PAXG/USDT (gold proxy) was #4, effectively tied with BTC on the
+# composite score and adds non-crypto diversification; SOL/USDT was the worst
+# (lowest win rate, lowest profit factor, highest drawdown).
 pairs:
-  - BTC/USDT
-  - ETH/USDT
-  - SOL/USDT
-  - PAXG/USDT          # gold proxy
-  - XRP/USDT
-  - BNB/USDT
-  - DOGE/USDT
+  - ETH/USDT   # rank #1 — best all-round (best avg R + return)
+  - XRP/USDT   # rank #2 — near-identical profile to ETH
+  - BTC/USDT   # rank #3 — best reliability (win rate / profit factor)
 
 indicator:
   ma_type: ALMA
@@ -73,7 +78,9 @@ timezone: Australia/Melbourne
 # ---------------------------------------------------------------------------
 execution:
   mode: paper          # off | paper | testnet | live
-  size_usdt: 25        # notional per entry
+  size_usdt: 200       # notional per entry — top-3 @ $200 deploys the full ~$600
+                       # budget and was the best setup in compare_portfolios.py
+                       # (at $75/signal the 3-pair portfolio leaves ~$375 idle)
   max_positions: 3     # concurrent open positions (flips always allowed)
   daily_loss_limit_usd: 50
   quiet_pause: true    # don't open/close during quiet_hours
