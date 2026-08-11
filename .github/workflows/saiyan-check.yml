@@ -78,18 +78,43 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true   # no artifact yet (first run) is fine
 
-      - name: Scan closed candles and send new signals
+      # The cloud paper-trader's state (open positions, safety rails, Telegram
+      # command offset) rides a second artifact from the same previous run.
+      # Missing on the first run(s) after this change — the executor then
+      # starts fresh, exactly like the signal state.
+      - name: Download previous execution state
+        if: steps.prev.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: saiyan-exec-state
+          path: state
+          run-id: ${{ steps.prev.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Scan closed candles, send new signals, run paper trader
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         # Exit 1 (job goes red) if any pair failed — the next scheduled run
         # retries those pairs. State for successful pairs is already advanced,
         # so nothing is re-sent.
-        run: python main.py check --state state/saiyan_state.json
+        # --exec-state engages the configured execution engine (paper by
+        # default) on the same events, so the cloud bot auto-trades in paper
+        # mode 24/7 alongside the alerts. Kill-switch commands (/stop /resume
+        # /status /recap /balance /flat) are polled from Telegram every run.
+        run: python main.py check --state state/saiyan_state.json --exec-state state/saiyan_exec_state.json
 
       - name: Upload state for the next run
         uses: actions/upload-artifact@v4
         with:
           name: saiyan-state
           path: state/saiyan_state.json
+          if-no-files-found: error
+
+      - name: Upload execution state for the next run
+        uses: actions/upload-artifact@v4
+        with:
+          name: saiyan-exec-state
+          path: state/saiyan_exec_state.json
           if-no-files-found: error

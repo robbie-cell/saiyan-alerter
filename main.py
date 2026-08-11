@@ -695,6 +695,24 @@ def run_check(cfg: RuntimeConfig, args) -> int:
     total_sent = 0
     failed_pairs: list = []
 
+    # Cloud auto-trader: when --exec-state is given, the configured execution
+    # engine (paper by default) runs on the same events this check sees. State
+    # is loaded at start and saved at the end, so positions, safety rails and
+    # the Telegram command offset persist between scheduled runs. Commands
+    # issued since the last run are processed up-front so e.g. /stop takes
+    # effect before this run opens anything.
+    executor = None
+    if not dry_run and args.exec_state:
+        try:
+            executor = make_executor(cfg.execution, Path(args.exec_state))
+        except Exception as exc:
+            log.exception("Executor init failed: %s", exc)
+        if executor is not None:
+            first_exec = not Path(args.exec_state).exists()
+            executor.check_commands(tg)
+            if first_exec:
+                tg.send_message("🤖 Cloud paper-trader online\n" + executor.status())
+
     if first_run and not dry_run:
         # One-time 'online' confirmation on the very first run (like live mode's
         # startup message) — never repeated, so cron doesn't spam Telegram.
@@ -718,6 +736,7 @@ def run_check(cfg: RuntimeConfig, args) -> int:
                 continue
             events = run_indicator(df_closed, cfg.cfg, symbol=symbol)
             last_closed = df_closed.index[-1]
+            last_close = float(df_closed["close"].iloc[-1])
             prev_raw = last_bar.get(symbol)
 
             if prev_raw is None or pd.Timestamp(prev_raw) < df_closed.index[0]:
@@ -738,6 +757,16 @@ def run_check(cfg: RuntimeConfig, args) -> int:
                 # Match live mode: quiet hours suppress delivery entirely (and
                 # state still advances, so old bars are never replayed later).
                 log.info("Check %s: quiet hours — skipping %d event(s).", symbol, len(new_events))
+                # Execution mirrors live mode too: paused during quiet hours
+                # unless execution.quiet_pause is explicitly disabled.
+                if executor is not None and not cfg.execution.quiet_pause:
+                    try:
+                        executor.last_prices[symbol] = last_close
+                        executor.process_events(new_events, tg)
+                    except Exception:
+                        log.exception("Exec %s: error during quiet feed — pair deferred.", symbol)
+                        failed_pairs.append(symbol)
+                        continue
             elif new_events:
                 ok = True
                 for e in new_events:
@@ -757,11 +786,33 @@ def run_check(cfg: RuntimeConfig, args) -> int:
                 if not dry_run:
                     total_sent += len(new_events)
 
+            # Paper execution mirrors the alerts 1:1. Feed BEFORE advancing the
+            # signal state: if the executor fails here the pair is deferred and
+            # the next run retries both together (the executor only persists on
+            # success, so a retry cannot double-open a position).
+            if executor is not None and not quiet.is_quiet():
+                try:
+                    executor.last_prices[symbol] = last_close
+                    executor.process_events(new_events, tg)
+                except Exception:
+                    log.exception("Exec %s: error — pair deferred for retry.", symbol)
+                    failed_pairs.append(symbol)
+                    continue
+
             # Advance only on full success (dry-run and quiet are deterministic).
             last_bar[symbol] = last_closed.isoformat()
         except Exception:
             log.exception("Check %s: error processing pair — will retry next run.", symbol)
             failed_pairs.append(symbol)
+
+    if executor is not None:
+        # Final pass: process commands that arrived during the run and persist
+        # the update offset + any state changes.
+        try:
+            executor.check_commands(tg)
+            executor.save()
+        except Exception:
+            log.exception("Executor final save failed.")
 
     _save_state(state_path, last_bar)
     if failed_pairs:
@@ -1083,6 +1134,12 @@ def main():
     pc.add_argument("--dry-run", action="store_true",
                     help="Print would-be alerts instead of sending to Telegram; state still "
                          "advances (use for testing).")
+    pc.add_argument("--exec-state", default=None,
+                    help="Path to the execution-state file. When set, the configured "
+                         "execution engine (paper/testnet/live) also runs on the events "
+                         "this check sees — cloud auto-trader mode. State is loaded at "
+                         "start and saved at the end, so positions, rails and the "
+                         "Telegram command offset persist between scheduled runs.")
 
     pdaily = sub.add_parser("daily",
         help="Send one Telegram recap of the last N hours: per-pair signals, closed-trade "

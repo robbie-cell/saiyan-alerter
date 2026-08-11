@@ -127,6 +127,7 @@ class Executor:
         self.halt_reason: Optional[str] = None
         self.day = ""
         self.realized_today = 0.0
+        self.starting_balance = float(getattr(ex_cfg, "starting_balance_usdt", 0.0) or 0.0)
         self.last_prices: dict[str, float] = {}
         self._update_offset: Optional[int] = None
         self._pnl_snapshot = 0.0   # sum of position realized at last ledger update
@@ -146,6 +147,9 @@ class Executor:
             self.halt_reason = raw.get("halt_reason")
             self.day = raw.get("day", "")
             self.realized_today = float(raw.get("realized_today", 0.0))
+            uid = raw.get("last_update_id")
+            if isinstance(uid, int):
+                self._update_offset = uid
         except Exception:
             log.exception("Could not load execution state %s — starting fresh.", self.state_path)
             self.day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -159,6 +163,7 @@ class Executor:
             "realized_today": self.realized_today,
             "halted": self.halted,
             "halt_reason": self.halt_reason,
+            "last_update_id": self._update_offset,
             "positions": [p.to_dict() for p in self.positions],
         }
         tmp = self.state_path.with_suffix(".json.tmp")
@@ -221,28 +226,43 @@ class Executor:
             text = (msg.get("text") or "").strip()
             if not text.startswith("/"):
                 continue
-            self._run_command(text.lower(), tg)
+            # Only act on commands from our configured chat; still ack others
+            # so they don't get re-delivered on every poll.
+            if str((msg.get("chat") or {}).get("id")) != str(tg.chat_id):
+                continue
+            self._run_command(text, tg)
 
     def _run_command(self, text: str, tg) -> None:
         self._update_day_pnl()
-        if text == "/status":
+        cmd, _, arg = text.partition(" ")
+        cmd = cmd.lower().strip()
+        if cmd == "/status":
             tg.send_message(self.status())
-        elif text == "/stop":
+        elif cmd == "/stop":
             self.halted = True
             self.halt_reason = "kill switch"
             self.save()
             tg.send_message("🛑 SAIYAN execution HALTED — no new entries. Open positions keep their exits.")
-        elif text == "/resume":
+        elif cmd == "/resume":
             self.halted = False
             self.halt_reason = None
             self.save()
             tg.send_message("▶️ SAIYAN execution resumed.")
-        elif text == "/flat":
+        elif cmd == "/flat":
             n = self.close_all()
-            self.save()
             tg.send_message(f"🏁 /flat: closed {n} position(s)." if n else "🏁 /flat: no open positions.")
+        elif cmd == "/recap":
+            n = 10
+            if arg.strip():
+                try:
+                    n = max(1, min(int(arg.strip()), 50))
+                except ValueError:
+                    pass
+            tg.send_message(self.recap(n))
+        elif cmd == "/balance":
+            tg.send_message(self.balance())
         else:
-            tg.send_message("Commands: /status /stop /resume /flat")
+            tg.send_message(self.help_text())
 
     # -- status -------------------------------------------------------------
 
@@ -265,6 +285,61 @@ class Executor:
         if self.halt_reason:
             lines.append(f"Halt reason: {self.halt_reason}")
         return "\n".join(lines)
+
+    def recap(self, n: int = 10) -> str:
+        """Summary of the last `n` closed trades: symbol, side, exit reason,
+        realized USDT, plus win rate and net for the window."""
+        closed = sorted((p for p in self.positions if p.closed),
+                        key=lambda p: p.closed_at or "", reverse=True)[:n]
+        lines = [f"📜 Recent trades (last {len(closed)} closed):"]
+        if not closed:
+            lines.append("   No closed trades yet — /status for open positions.")
+        for p in closed:
+            at = (p.closed_at or "")[11:16]  # HH:MM from ISO timestamp (UTC)
+            lines.append(f"   {at}Z {p.symbol} {p.side:<5} {p.reason:<8} ${p.realized:+.2f}")
+        if closed:
+            wins = sum(1 for p in closed if p.realized > 0)
+            net = sum(p.realized for p in closed)
+            lines.append(f"   Win rate {wins / len(closed):.0%} · Net ${net:+.2f}")
+            open_n = sum(1 for p in self.positions if not p.closed)
+            if open_n:
+                lines.append(f"   ({open_n} open — /status for details)")
+        return "\n".join(lines)
+
+    def balance(self) -> str:
+        """Account view: equity (when starting_balance is set), realized PnL,
+        today's PnL, open unrealized PnL and notional at risk."""
+        self._update_day_pnl()
+        realized = sum(p.realized for p in self.positions)
+        open_pos = [p for p in self.positions if not p.closed]
+        unreal = 0.0
+        notional = 0.0
+        for p in open_pos:
+            px = self.last_prices.get(p.symbol, p.entry)
+            sign = 1.0 if p.side == "Long" else -1.0
+            unreal += sign * (px - p.entry) / p.entry * p.remaining * p.size
+            notional += p.size * p.remaining
+        lines = [f"💰 Balance [{self.mode.upper()}]"]
+        if self.starting_balance > 0:
+            equity = self.starting_balance + realized + unreal
+            lines.append(f"   Equity: ${equity:,.2f}  (start ${self.starting_balance:,.0f})")
+        lines.append(f"   Realized (all time): ${realized:+,.2f}")
+        lines.append(f"   Today: ${self.realized_today:+,.2f} (cap ${-self.cfg.daily_loss_limit_usd:g})")
+        lines.append(f"   Open: {len(open_pos)} · unrealized ${unreal:+,.2f} · at risk ${notional:,.2f}")
+        if self.halted:
+            lines.append(f"   ⛔ HALTED ({self.halt_reason})")
+        return "\n".join(lines)
+
+    def help_text(self) -> str:
+        return (
+            "🤖 SAIYAN bot commands:\n"
+            "/status — mode, open positions, day PnL\n"
+            "/recap [N] — last N closed trades + win rate (default 10)\n"
+            "/balance — equity, realized, open risk\n"
+            "/stop — halt new entries (kill switch)\n"
+            "/resume — re-enable entries\n"
+            "/flat — close all open positions now"
+        )
 
     # -- backend hooks ------------------------------------------------------
 

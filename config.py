@@ -44,6 +44,7 @@ class ExecutionConfig:
     daily_loss_limit_usd: float = 50.0
     quiet_pause: bool = True   # don't trade during quiet_hours
     live_confirmation: bool = False
+    starting_balance_usdt: float = 0.0  # display-only equity baseline for /balance
     tp_levels_pct: Tuple[float, float, float] = (1.0, 1.5, 2.0)  # set from indicator block
     sl_level_pct: float = 0.5
 
@@ -139,6 +140,7 @@ def load_config(path: Path = DEFAULT_CFG_PATH) -> RuntimeConfig:
         daily_loss_limit_usd=float(ex.get("daily_loss_limit_usd", 50.0)),
         quiet_pause=bool(ex.get("quiet_pause", True)),
         live_confirmation=bool(ex.get("live_confirmation", False)),
+        starting_balance_usdt=float(ex.get("starting_balance_usdt", 0.0)),
     )
     execution.tp_levels_pct = cfg.tp_levels_pct
     execution.sl_level_pct = cfg.sl_level_pct
