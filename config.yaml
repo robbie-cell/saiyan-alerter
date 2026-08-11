@@ -78,7 +78,8 @@ timezone: Australia/Melbourne
 # shown by /balance — paper accounts only, no effect on trading).
 # ---------------------------------------------------------------------------
 execution:
-  mode: off            # off | paper | testnet | live — off = alerts only, nothing trades
+  mode: "off"          # off | paper | testnet | live — off = alerts only, nothing trades
+                       # (quoted: PyYAML would parse the bare word `off` as a boolean)
   size_usdt: 200       # notional per entry (top-3 @ $200 was the best $600-account
                        # setup from compare_portfolios.py; only used when mode != off)
   max_positions: 3     # concurrent open positions (flips always allowed)

@@ -130,7 +130,13 @@ def load_config(path: Path = DEFAULT_CFG_PATH) -> RuntimeConfig:
         quiet_hours = (int(quiet_hours[0]), int(quiet_hours[1]))
 
     ex = raw.get("execution") or {}
-    mode = str(ex.get("mode", "off")).lower()
+    mode = ex.get("mode", "off")
+    if isinstance(mode, bool):
+        # YAML 1.1 (PyYAML) parses the bare words `off`/`on`/`yes`/`no` as
+        # booleans, so an unquoted `mode: off` arrives as False. Map back to
+        # the string so the validation below sees "off".
+        mode = "off" if mode is False else "on"
+    mode = str(mode).lower()
     if mode not in ("off", "paper", "testnet", "live"):
         raise ValueError("`execution.mode` must be one of off|paper|testnet|live.")
     execution = ExecutionConfig(
