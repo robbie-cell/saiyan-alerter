@@ -1,8 +1,19 @@
 # SAIYAN alerter — scheduled signal scan (GitHub Actions cron)
 #
 # Runs `main.py check` every 5 minutes. Each run fetches trailing candles,
-# recomputes the indicator, and sends only events on bars closed since the last
-# run (per-pair progress is carried between runs via the `saiyan-state` artifact).
+# recomputes the (filter-gated) indicator, and sends only events on bars closed
+# since the last run (per-pair progress is carried between runs via the
+# `saiyan-state` artifact).
+#
+# Institutional filter stack: config.yaml `filters:` enables the 4h EMA30 hard
+# trend gate — raw entries that fight the higher timeframe are blocked, so only
+# with-trend signals fire (~1-2/day). Blocked signals are counted per run and
+# surfaced in the daily recap's "🔇 filtered" line.
+#
+# Live track record: each run also appends newly-closed trades to
+# `saiyan_ledger.json` (keyed by symbol+entry_time, idempotent), which rides the
+# same artifact and feeds the daily recap's "📈 Track record" line — a measured,
+# cumulative win rate / avg R / net % on real closes.
 #
 # Cadence: this repo is PUBLIC, so Actions minutes are unlimited and a 5-minute
 # schedule is free. Runs are offset 1 minute past each 5-minute boundary
@@ -52,9 +63,9 @@ jobs:
         run: pip install -r requirements.txt
 
       # The bot needs the previous run's state file (which bars it already
-      # reported per pair). The very first run has no predecessor — the
-      # download step is skipped and the bot baselines on the most recent
-      # closed bar without replaying old signals.
+      # reported per pair) and its signal ledger. The very first run has no
+      # predecessor — the download step is skipped and the bot baselines on the
+      # most recent closed bar without replaying old signals.
       - name: Find previous successful run
         id: prev
         env:
@@ -89,11 +100,11 @@ jobs:
         # so no --exec-state flag and no exec-state artifact. Flip mode to
         # paper/testnet/live and add `--exec-state state/saiyan_exec_state.json`
         # here to re-enable the cloud auto-trader.
-        run: python main.py check --state state/saiyan_state.json
+        run: python main.py check --state state/saiyan_state.json --ledger state/saiyan_ledger.json
 
-      - name: Upload state for the next run
+      - name: Upload state + ledger for the next run
         uses: actions/upload-artifact@v4
         with:
           name: saiyan-state
-          path: state/saiyan_state.json
+          path: state/          # saiyan_state.json + saiyan_ledger.json
           if-no-files-found: error

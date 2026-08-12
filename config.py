@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 import yaml
 from dotenv import load_dotenv
 
+from filters import FilterConfig
 from indicator import IndicatorConfig
 
 ROOT = Path(__file__).parent
@@ -60,6 +61,7 @@ class RuntimeConfig:
     quiet_hours: Optional[Tuple[int, int]] = None  # (start_hour, end_hour) local
     timezone: str = "UTC"
     execution: Optional[ExecutionConfig] = None
+    filters: Optional[FilterConfig] = None   # institutional filter stack (config.yaml `filters:` block)
 
 
 def _load_yaml(path: Path) -> dict:
@@ -151,6 +153,35 @@ def load_config(path: Path = DEFAULT_CFG_PATH) -> RuntimeConfig:
     execution.tp_levels_pct = cfg.tp_levels_pct
     execution.sl_level_pct = cfg.sl_level_pct
 
+    # Institutional filter stack (config.yaml `filters:` block). Absent block =
+    # no filtering (raw indicator signals). Explicit `enabled: false` also
+    # disables it — run_indicator checks the flag.
+    f = raw.get("filters")
+    filters = None
+    if isinstance(f, dict):
+        sess = f.get("session_utc")
+        if isinstance(sess, list) and len(sess) == 2:
+            sess = (int(sess[0]), int(sess[1]))
+        else:
+            sess = None
+        filters = FilterConfig(
+            enabled=bool(f.get("enabled", True)),
+            htf_minutes=int(f.get("htf_minutes", 240)),
+            htf_ema_len=int(f.get("htf_ema_len", 30)),
+            ltf_ema_len=int(f.get("ltf_ema_len", 0)),
+            hard_htf=bool(f.get("hard_htf", True)),
+            vol_window=int(f.get("vol_window", 960)),
+            vol_low_pct=float(f.get("vol_low_pct", 10.0)),
+            vol_high_pct=float(f.get("vol_high_pct", 90.0)),
+            block_vol_low=bool(f.get("block_vol_low", False)),
+            block_vol_high=bool(f.get("block_vol_high", False)),
+            momentum=str(f.get("momentum", "off")),
+            hard_momentum=bool(f.get("hard_momentum", False)),
+            cooldown_sl_bars=int(f.get("cooldown_sl_bars", 0)),
+            cooldown_tp_bars=int(f.get("cooldown_tp_bars", 0)),
+            session_utc=sess,
+        )
+
     return RuntimeConfig(
         pairs=pairs,
         exchange=exchange,
@@ -161,4 +192,5 @@ def load_config(path: Path = DEFAULT_CFG_PATH) -> RuntimeConfig:
         quiet_hours=quiet_hours,
         timezone=str(raw.get("timezone", "UTC")),
         execution=execution,
+        filters=filters,
     )

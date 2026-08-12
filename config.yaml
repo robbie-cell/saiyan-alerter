@@ -47,6 +47,52 @@ indicator:
   sl_level_pct: 0.5
   trade_type: BOTH         # LONG / SHORT / BOTH / NONE
 
+# ---------------------------------------------------------------------------
+# Institutional filter stack (filters.py) — the confluence layer on top of the
+# raw indicator signal.
+#
+# The ONLY hard gate that earned its place in the 95-day fee-adjusted A/B
+# (research.py, all 7 pairs, parity-checked against the original backtest):
+#
+#   HARD: 4h EMA(30) trend alignment — entries are BLOCKED unless they trade
+#         WITH the higher-timeframe trend (Long only while 4h close > its
+#         EMA30, Short only below). This is the whole institutional edge:
+#         net edge/trade +64% (0.30% -> 0.49%), profit factor 3.06 -> 5.63,
+#         max drawdown 4.84% -> 2.11%, win rate 63% -> 72% (90d, net of fees
+#         + slippage). It costs signal volume (~85-90% blocked) — that is the
+#         point: only with-trend signals fire, ~1-2/day across 3 pairs.
+#
+#   SOFT (grade-only, never block): volatility regime (LOW/MID/HIGH ATR
+#   percentile) and entry-bar momentum contribute to the Confidence: x/5 line
+#   on each alert. Research showed BLOCKING on them HURTS the edge (they remove
+#   good entries), so they are informational only.
+#
+# Settings that research REJECTED (kept here as documentation, all off):
+#   * block_vol_low/high   — removing dead/chaotic vol removed good trades
+#   * hard_momentum        — impulse gating cut win rate to 51%
+#   * cooldown_sl_bars     — no edge gain, just fewer trades
+#   * session_utc          — session gating made every metric worse
+# Full numbers in research_report.json / research_htf_report.json.
+# ---------------------------------------------------------------------------
+filters:
+  enabled: true
+  # Hard trend gate (the edge).
+  htf_minutes: 240          # 4h bars (resampled from the 15m feed)
+  htf_ema_len: 30           # EMA(30) on 4h closes (~5 days of context)
+  hard_htf: true            # misaligned entries are BLOCKED
+  # Soft confidence inputs (never block).
+  ltf_ema_len: 0            # 15m EMA trend — 0 = off
+  vol_window: 960           # 10 days at 15m for the ATR percentile bands
+  vol_low_pct: 10.0
+  vol_high_pct: 90.0
+  block_vol_low: false      # research: blocking dead vol removed good trades
+  block_vol_high: false
+  momentum: impulse         # close-in-direction soft credit for confidence
+  hard_momentum: false
+  cooldown_sl_bars: 0       # research: no edge gain
+  cooldown_tp_bars: 0
+  session_utc: null         # null = 24/7 (session gating made metrics worse)
+
 # dedupe ignores repeat (symbol, kind) signals within this many minutes
 dedupe_minutes: 5
 

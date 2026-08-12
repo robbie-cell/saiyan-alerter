@@ -65,6 +65,10 @@ class Event:
     # alone. Defaults to empty frozenset for legacy events and Entry events (nothing
     # filled BEFORE Entry fires).
     filled: frozenset = field(default_factory=frozenset)
+    # Institutional filter grade + tags, set on Entry events when the filter
+    # stack is active. None for legacy/management events.
+    confidence: Optional[int] = None
+    context: Optional[tuple] = None
 
 
 
@@ -309,7 +313,8 @@ def _shift_for_delay(arr: np.ndarray, delay: int) -> np.ndarray:
     return out
 
 
-def run_indicator(df: pd.DataFrame, cfg: IndicatorConfig, symbol: str = "?") -> list:
+def run_indicator(df: pd.DataFrame, cfg: IndicatorConfig, symbol: str = "?",
+                  filter_cfg=None, block_log=None) -> list:
     """Run the indicator over `df` (OHLCV, DatetimeIndex, UTC). Returns events.
     Signal evaluation uses bar i's high/low/close against bar i-1's high/low against
     state from bar i-1 — i.e., closed-bar semantics.
@@ -393,12 +398,32 @@ def run_indicator(df: pd.DataFrame, cfg: IndicatorConfig, symbol: str = "?") -> 
     is_short = cfg.trade_type in ("SHORT", "BOTH")
     is_any   = cfg.trade_type != "NONE"
 
+    # Institutional filter stack (causal confluence + hard gates). When
+    # active, candidate entries are gated per bar; a blocked entry leaves
+    # the state machine flat, so no phantom TP/SL events follow downstream.
+    entry_filter = None
+    _conf_fn = None
+    if filter_cfg is not None and getattr(filter_cfg, "enabled", True):
+        from filters import EntryFilter, confidence as _conf_fn_import
+        entry_filter = EntryFilter(filter_cfg, df, symbol=symbol, block_log=block_log)
+        _conf_fn = _conf_fn_import
+
     for i in range(1, n):  # start at 1 — need prior bar for cross checks
         le_i = bool(le_bo[i])
         se_i = bool(se_bo[i])
 
+        # Gate the entry (strictly causal): a blocked entry opens nothing.
+        le_ok = le_i and state <= 0
+        se_ok = se_i and state >= 0
+        passed_tags = None
+        if entry_filter is not None:
+            if le_ok:
+                le_ok, passed_tags = entry_filter(i, "Long")
+            if se_ok:
+                se_ok, passed_tags = entry_filter(i, "Short")
+
         # Update entry / SL / TP lines from current bar
-        if le_i and state <= 0:
+        if le_ok:
             entry_i = closes[i]
             sl_i    = entry_i * (1 - cfg.sl_level_pct / 100.0)
             tp1_i   = entry_i * (1 + cfg.tp_levels_pct[0] / 100.0)
@@ -406,7 +431,7 @@ def run_indicator(df: pd.DataFrame, cfg: IndicatorConfig, symbol: str = "?") -> 
             tp3_i   = entry_i * (1 + cfg.tp_levels_pct[2] / 100.0)
             current_plan = Plan(side="Long", entry_price=entry_i,
                                 tp1=tp1_i, tp2=tp2_i, tp3=tp3_i, sl=sl_i)
-        elif se_i and state >= 0:
+        elif se_ok:
             entry_i = closes[i]
             sl_i    = entry_i * (1 + cfg.sl_level_pct / 100.0)
             tp1_i   = entry_i * (1 - cfg.tp_levels_pct[0] / 100.0)
@@ -439,9 +464,9 @@ def run_indicator(df: pd.DataFrame, cfg: IndicatorConfig, symbol: str = "?") -> 
 
         # Switch (priority: entry > TP3 > TP2 > TP1 > SL; per Pine ordering)
         new_state = state
-        if le_i and state <= 0:
+        if le_ok:
             new_state = 1.0
-        elif se_i and state >= 0:
+        elif se_ok:
             new_state = -1.0
         elif tp3_long  and state ==  1.2: new_state =  1.3
         elif tp3_short and state == -1.2: new_state = -1.3
@@ -451,6 +476,15 @@ def run_indicator(df: pd.DataFrame, cfg: IndicatorConfig, symbol: str = "?") -> 
         elif tp1_short and state == -1.0: new_state = -1.1
         elif sl_long   and state >=  1.0: new_state =  0.0
         elif sl_short  and state <= -1.0: new_state =  0.0
+
+        # Feed the filter's sequential state: cooldowns count from the
+        # actual close bars (a stop-out or a fully-banked TP3), never from
+        # entry bars.
+        if entry_filter is not None:
+            if (state ==  1.2 and new_state ==  1.3) or (state == -1.2 and new_state == -1.3):
+                entry_filter.mark_tp(i)
+            if new_state == 0.0 and ((sl_long and state >= 1.0) or (sl_short and state <= -1.0)):
+                entry_filter.mark_sl(i)
 
         evt_time = df.index[i]
         # Emit events in switch-priority order (a single bar yields at most one event).
@@ -480,9 +514,17 @@ def run_indicator(df: pd.DataFrame, cfg: IndicatorConfig, symbol: str = "?") -> 
             events.append(Event(evt_time, symbol, "Short SL",  highs[i], sl_i, plan=current_plan, filled=sl_filled))
             current_plan = None  # position closed at SL; future bars carry no plan until next entry
         elif new_state ==  1.0 and state <= 0 and is_any:
-            events.append(Event(evt_time, symbol, "Long Entry",  closes[i], closes[i], plan=current_plan))
+            ev = Event(evt_time, symbol, "Long Entry",  closes[i], closes[i], plan=current_plan)
+            if entry_filter is not None and passed_tags is not None:
+                ev.confidence = _conf_fn(passed_tags)
+                ev.context = tuple(passed_tags)
+            events.append(ev)
         elif new_state == -1.0 and state >= 0 and is_any:
-            events.append(Event(evt_time, symbol, "Short Entry", closes[i], closes[i], plan=current_plan))
+            ev = Event(evt_time, symbol, "Short Entry", closes[i], closes[i], plan=current_plan)
+            if entry_filter is not None and passed_tags is not None:
+                ev.confidence = _conf_fn(passed_tags)
+                ev.context = tuple(passed_tags)
+            events.append(ev)
 
         state = new_state
         entry_val, sl_val, tp1_val, tp2_val, tp3_val = entry_i, sl_i, tp1_i, tp2_i, tp3_i

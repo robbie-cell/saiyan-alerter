@@ -177,6 +177,17 @@ def format_event(event, tz_name: str = "UTC") -> str:
         if abs(event.level - event.price) > 1e-12:
             lines.append(f"Level:  {_fmt_price(event.level)}")
 
+    # Institutional filter grade (entries only): 2–5 with the confluence tags
+    # that passed (htf = 4h trend aligned, vol = normal volatility regime,
+    # mom = entry-bar impulse in the trade direction).
+    if getattr(event, "confidence", None) is not None:
+        tags = event.context or ()
+        tag_str = ", ".join("vol" if t == "vol:OK" else t for t in tags)
+        conf_line = f"Confidence: {event.confidence}/5"
+        if tag_str:
+            conf_line += f"   [{tag_str}]"
+        lines.append(conf_line)
+
     if event.plan is not None:
         is_entry = event.kind.endswith(" Entry")
         # Plan percentages are always relative to the ENTRY price, so the plan

@@ -492,7 +492,7 @@ def _process_symbol(cfg: RuntimeConfig, pair: PairConfig, tg: TelegramClient, de
     df_closed = df[df.index <= cutoff]
     if df_closed.empty:
         return []
-    events = run_indicator(df_closed, cfg.cfg, symbol=symbol)
+    events = run_indicator(df_closed, cfg.cfg, symbol=symbol, filter_cfg=cfg.filters)
     last_bar_time = df_closed.index[-1]
     new_events = [e for e in events if e.time == last_bar_time]
     last_close = float(df_closed["close"].iloc[-1])
@@ -694,6 +694,9 @@ def run_check(cfg: RuntimeConfig, args) -> int:
     dry_run = bool(args.dry_run)
     total_sent = 0
     failed_pairs: list = []
+    # Live signal track record (persisted, outcome-tracked) — see SignalLedger.
+    ledger = SignalLedger(Path(args.ledger)) if args.ledger else None
+    block_log: list = [] if cfg.filters else None
 
     # Cloud auto-trader: when --exec-state is given, the configured execution
     # engine (paper by default) runs on the same events this check sees. State
@@ -722,7 +725,7 @@ def run_check(cfg: RuntimeConfig, args) -> int:
         symbol = pair.symbol
         exchange_id = pair.exchange or cfg.exchange
         try:
-            df = fetch_candles(exchange_id, symbol, timeframe_str, limit=1500)
+            df = fetch_candles(exchange_id, symbol, timeframe_str, limit=3000)
             if df.empty:
                 log.warning("Check %s: no candles returned — will retry next run.", symbol)
                 failed_pairs.append(symbol)
@@ -734,7 +737,8 @@ def run_check(cfg: RuntimeConfig, args) -> int:
                 log.warning("Check %s: no fully-closed bars yet — will retry next run.", symbol)
                 failed_pairs.append(symbol)
                 continue
-            events = run_indicator(df_closed, cfg.cfg, symbol=symbol)
+            events = run_indicator(df_closed, cfg.cfg, symbol=symbol,
+                                      filter_cfg=cfg.filters, block_log=block_log)
             last_closed = df_closed.index[-1]
             last_close = float(df_closed["close"].iloc[-1])
             prev_raw = last_bar.get(symbol)
@@ -799,6 +803,12 @@ def run_check(cfg: RuntimeConfig, args) -> int:
                     failed_pairs.append(symbol)
                     continue
 
+            # Live track record: record any trades the indicator just closed
+            # (deterministic reconstruction from the same candles — idempotent by
+            # (symbol, entry_time) key, so reruns never double-count).
+            if ledger is not None:
+                ledger.sync(symbol, events, cfg.cfg)
+
             # Advance only on full success (dry-run and quiet are deterministic).
             last_bar[symbol] = last_closed.isoformat()
         except Exception:
@@ -813,6 +823,14 @@ def run_check(cfg: RuntimeConfig, args) -> int:
             executor.save()
         except Exception:
             log.exception("Executor final save failed.")
+
+    if ledger is not None:
+        try:
+            ledger.save()
+        except Exception:
+            log.exception("Ledger save failed.")
+    if block_log:
+        log.info("Check: %d raw signal(s) blocked by the filter stack this run.", len(block_log))
 
     _save_state(state_path, last_bar)
     if failed_pairs:
@@ -890,6 +908,94 @@ def _reconstruct_trades(events: list, cfg: IndicatorConfig):
     return trades, open_trade
 
 
+class SignalLedger:
+    """Outcome-tracked signal record, persisted between cron runs.
+
+    The check workflow recomputes the full event stream from candles on every
+    5-minute run and appends any newly-closed trade to this ledger (keyed by
+    (symbol, entry_time), so reruns never double-count). Over days it becomes
+    a *measured* track record of the signals as they actually resolved — win
+    rate, average R and net % computed from real closes, not promises. The
+    daily recap reads it for its "Track record" line.
+    """
+    MAX_RECORDS = 1000
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.data = self._load()
+        # The track record starts NOW (deployment), never backdated: the ledger
+        # must not mix pre-gate history into the measured record of the
+        # filtered signals. Trades entered before this epoch are excluded.
+        if self.data.get("started") is None:
+            self.data["started"] = datetime.now(timezone.utc).isoformat()
+
+    def _load(self) -> dict:
+        default = {"version": 2, "started": None, "trades": []}
+        if not self.path.exists():
+            return default
+        try:
+            d = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(d, dict) and isinstance(d.get("trades"), list):
+                return d
+        except Exception as exc:
+            log.warning("Ignoring unreadable ledger %s: %s", self.path, exc)
+        return default
+
+    def _keys(self) -> set:
+        return {(t["symbol"], t["entry_time"]) for t in self.data["trades"]}
+
+    def sync(self, symbol: str, events: list, cfg: IndicatorConfig) -> None:
+        """Append trades closed in `events` (idempotent by entry key)."""
+        trades, _open = _reconstruct_trades(events, cfg)
+        if not trades:
+            return
+        started = pd.Timestamp(self.data.get("started"))
+        seen = self._keys()
+        for t in trades:
+            if t["entry_time"] < started:
+                continue  # entered before the ledger epoch — not part of this record
+            key = (symbol, t["entry_time"].isoformat())
+            if key in seen:
+                continue
+            r = t["ret"] / (cfg.sl_level_pct / 100.0)
+            self.data["trades"].append({
+                "symbol": symbol,
+                "entry_time": t["entry_time"].isoformat(),
+                "exit_time": t["exit_time"].isoformat(),
+                "side": t["side"],
+                "entry_price": round(float(t["entry_price"]), 6),
+                "ret": round(float(t["ret"]), 6),
+                "r": round(float(r), 4),
+                "reason": t["reason"],
+            })
+            seen.add(key)
+        # Keep the artifact small: newest MAX_RECORDS only.
+        if len(self.data["trades"]) > self.MAX_RECORDS:
+            self.data["trades"] = self.data["trades"][-self.MAX_RECORDS:]
+
+    def track_record(self) -> Optional[dict]:
+        """Aggregate stats over all recorded closed trades."""
+        tr = self.data["trades"]
+        if not tr:
+            return None
+        wins = [t for t in tr if t["ret"] > 0]
+        net = sum(t["ret"] for t in tr)
+        return {
+            "trades": len(tr),
+            "win_rate": len(wins) / len(tr) * 100.0,
+            "avg_r": sum(t["r"] for t in tr) / len(tr),
+            "net_pct": net * 100.0,
+            "since": self.data.get("started", tr[0]["entry_time"])[:10],
+            "until": tr[-1]["exit_time"][:10],
+        }
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
+
+
 def run_daily(cfg: RuntimeConfig, args) -> int:
     """Send one Telegram recap of the last `--hours` (default 24): per pair, the
     day's entry signals, closed-trade win rate and net %, and any still-open
@@ -905,6 +1011,9 @@ def run_daily(cfg: RuntimeConfig, args) -> int:
     dry_run = bool(args.dry_run)
     tf_minutes = cfg.cfg.chart_timeframe_min
     timeframe_str = minutes_to_timeframe(tf_minutes)
+    # Cumulative track record (from the check workflow's ledger artifact).
+    ledger = SignalLedger(Path(args.ledger)) if args.ledger else None
+    block_log: list = [] if cfg.filters else None
 
     lines = []
     grand_entries = grand_closed = grand_wins = 0
@@ -921,7 +1030,8 @@ def run_daily(cfg: RuntimeConfig, args) -> int:
             now_utc = pd.Timestamp.now(tz="UTC")
             cutoff = now_utc - pd.Timedelta(minutes=tf_minutes) - pd.Timedelta(seconds=30)
             df_closed = df[df.index <= cutoff]
-            events = run_indicator(df_closed, cfg.cfg, symbol=symbol)
+            events = run_indicator(df_closed, cfg.cfg, symbol=symbol,
+                                    filter_cfg=cfg.filters, block_log=block_log)
             trades, open_t = _reconstruct_trades(events, cfg.cfg)
 
             entries = [e for e in events if e.kind.endswith(" Entry") and e.time >= start]
@@ -976,6 +1086,22 @@ def run_daily(cfg: RuntimeConfig, args) -> int:
     msg.append("━━━━━━━━━━━━━━━━━━━━━")
     msg.append(f"Total: {grand_entries} signals · {grand_closed} closed · "
                f"win rate {total_wr:.0f}% · net {grand_net:+.1f}%")
+
+    # Filter discipline: how many raw signals the hard 4h trend gate rejected
+    # inside the recap window (deterministic recompute — no extra state).
+    if block_log:
+        n_filtered = sum(1 for b in block_log
+                         if pd.Timestamp(b["time"]).tz_convert("UTC") >= start)
+        if n_filtered:
+            msg.append(f"🔇 {n_filtered} raw signal(s) filtered by the 4h trend gate")
+
+    # Cumulative measured track record from the signal ledger.
+    if ledger is not None:
+        tr = ledger.track_record()
+        if tr and tr["trades"]:
+            msg.append(f"📈 Track record ({tr['since']} → {tr['until']}): "
+                       f"{tr['trades']} closed · win {tr['win_rate']:.0f}% · "
+                       f"avg R {tr['avg_r']:+.2f} · net {tr['net_pct']:+.1f}%")
     text = "\n".join(msg)
 
     log.info("Daily recap:\n%s", text)
@@ -1134,6 +1260,9 @@ def main():
     pc.add_argument("--dry-run", action="store_true",
                     help="Print would-be alerts instead of sending to Telegram; state still "
                          "advances (use for testing).")
+    pc.add_argument("--ledger", default=None,
+                    help="Path to the signal track-record file (SignalLedger). "
+                         "Updated with closed-trade outcomes on every run.")
     pc.add_argument("--exec-state", default=None,
                     help="Path to the execution-state file. When set, the configured "
                          "execution engine (paper/testnet/live) also runs on the events "
@@ -1148,6 +1277,9 @@ def main():
                         help="Recap window in hours. Default: 24.")
     pdaily.add_argument("--dry-run", action="store_true",
                         help="Print the recap instead of sending to Telegram.")
+    pdaily.add_argument("--ledger", default=None,
+                        help="Path to the signal track-record file (SignalLedger); "
+                             "adds the cumulative Track record line to the recap.")
 
     ps = sub.add_parser("summarize", help="Pretty-print kind histogram + stats for one replay CSV.")
     ps.add_argument("--input", required=True, help="Path to a replay CSV (e.g. replays/btc_replay.csv).")

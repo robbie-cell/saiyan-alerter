@@ -2,8 +2,15 @@
 #
 # Runs `python main.py daily` which recomputes the last 24h from candles and
 # sends a single digestible recap: per-pair signals, closed-trade win rate and
-# net %, and open positions with unrealized PnL. Also doubles as a daily
-# liveness check — if you stop getting these, the bot is down.
+# net %, open positions with unrealized PnL, how many raw signals the 4h trend
+# gate filtered ("🔇"), and the cumulative measured track record from the
+# signal ledger ("📈" — win rate / avg R / net % on real closes since the
+# ledger started). Also doubles as a daily liveness check — if you stop getting
+# these, the bot is down.
+#
+# The ledger is downloaded from the latest successful saiyan-check run
+# (same artifact name, so the first day or two before it exists is fine —
+# the download is continue-on-error and the recap simply omits that line).
 #
 # Time: 23:59 Melbourne (AEST = UTC+10) → 13:59 UTC. To change the hour, edit
 # the cron below (GitHub schedules are UTC): convert your local hour to UTC.
@@ -18,6 +25,7 @@ on:
   workflow_dispatch: {}    # allow manual runs (e.g. to test)
 
 permissions:
+  actions: read    # find + download the check workflow's state/ledger artifact
   contents: read
 
 jobs:
@@ -34,8 +42,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Find latest successful check run
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID=$(gh api "repos/${{ github.repository }}/actions/runs?workflow=saiyan-check.yml&status=success&per_page=1" --jq '.workflow_runs[0].id // empty')
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Download signal ledger
+        if: steps.prev.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: saiyan-state
+          path: state
+          run-id: ${{ steps.prev.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true   # no ledger yet (first day) is fine
+
       - name: Send daily recap
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python main.py daily --hours 24
+        run: python main.py daily --hours 24 --ledger state/saiyan_ledger.json
