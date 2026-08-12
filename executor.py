@@ -76,11 +76,13 @@ class Position:
     venue: str = "paper"       # paper | testnet | live
     fill_ts: str = ""          # last order fill timestamp (for reconciliation)
 
-    def bank_tp(self, frac: float, tp_idx: int, level: float) -> float:
+    def bank_tp(self, frac: float, tp_idx: int, level: float,
+                advance: bool = True) -> float:
         """Bank PnL for a TP at its PLAN level (ATR-scaled when exits=atr).
 
         Mirrors research.reconstruct: gain = |level - entry| / entry * frac.
-        Returns the USDT PnL banked.
+        `advance=False` (partial fill) keeps tp_taken unchanged so the level
+        stays open and the remainder is retried. Returns the USDT PnL banked.
         """
         if not level or self.entry <= 0:
             return 0.0
@@ -88,28 +90,34 @@ class Position:
         self.partial_ret += ret
         self.realized += ret * self.size
         self.remaining -= frac
-        self.tp_taken += 1
+        if advance:
+            self.tp_taken += 1
         if self.remaining <= 1e-9:
             self.remaining = 0.0
         return ret * self.size
 
-    def bank_sl(self, price: float, level: Optional[float] = None) -> float:
-        """Bank the SL loss on the remainder.
+    def bank_sl(self, price: float, level: Optional[float] = None,
+                frac: Optional[float] = None) -> float:
+        """Bank the SL loss on a fraction of the position (default: all of
+        the remainder).
 
         Charges the ACTUAL crossed level when provided (research.py charges
         e.level — a breakeven-trailed stop moves the stop to entry without
         mutating plan.sl, and the loss must reflect where it really filled).
         Falls back to the plan stop, then to price-based.
         """
+        frac = self.remaining if frac is None else frac
         lvl = level if level else self.sl
         if lvl and self.entry > 0:
-            ret = -(abs(lvl - self.entry) / self.entry) * self.remaining
+            ret = -(abs(lvl - self.entry) / self.entry) * frac
         else:
             sign = 1.0 if self.side == "Long" else -1.0
-            ret = sign * (price - self.entry) / self.entry * self.remaining
+            ret = sign * (price - self.entry) / self.entry * frac
         self.partial_ret += ret
         self.realized += ret * self.size
-        self.remaining = 0.0
+        self.remaining -= frac
+        if self.remaining <= 1e-9:
+            self.remaining = 0.0
         return ret * self.size
 
     def bank_price(self, frac: float, price: float) -> float:
@@ -524,6 +532,10 @@ class GateExecutor(Executor):
         if not self.exchange.apiKey:
             raise SystemExit(
                 f"GATE_API_KEY/GATE_API_SECRET must be set for {self.venue} mode.")
+        # Restart reconciliation: re-sync open positions against real balances
+        # so a close that happened while we were down is never re-traded or
+        # double-booked.
+        self._sync_from_exchange()
 
     # -- reconciliation -----------------------------------------------------
 
@@ -532,10 +544,16 @@ class GateExecutor(Executor):
         if units <= 1e-12:
             return None
         order = self.exchange.create_order(pos.symbol, "market", side, units)
-        try:
-            filled = self.exchange.fetch_order(order["id"], pos.symbol)
-        except Exception:
-            # Order may be done but fetch raced; fall back to the submitted info.
+        filled = None
+        for attempt in range(4):
+            try:
+                filled = self.exchange.fetch_order(order["id"], pos.symbol)
+                if filled.get("filled") and float(filled["filled"]) > 0:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.25 * (attempt + 1))
+        if filled is None:
             filled = order
         cost = 0.0
         amount = 0.0
@@ -592,6 +610,15 @@ class GateExecutor(Executor):
                                if p.symbol == symbol and not p.closed), None)
                 if open_p is not None:
                     self._market_close(open_p, tg, "flip")
+                    if not open_p.closed:
+                        # Flip close only partially filled — the old position
+                        # still holds exposure. Opening the new side now would
+                        # double up on the symbol; defer until the flip fully
+                        # closes (retried by the monitor pass / next tick).
+                        self._notify_error(tg, symbol,
+                                           f"flip deferred — {open_p.remaining:.1%} of the "
+                                           f"old position still open after partial fill")
+                        continue
                 ok, why = self._can_open(symbol)
                 if not ok:
                     self._notify_skip(tg, symbol, side, price, why)
@@ -619,6 +646,33 @@ class GateExecutor(Executor):
                 self._close_fraction(open_p, idx + 1, tg)
             elif "SL" in kind and open_p.remaining > 1e-9:
                 self._market_close(open_p, tg, "SL")
+        # Self-healing monitor pass: check mode (GitHub cron) has no tick loop,
+        # so partial fills / missed crosses are caught here against the last
+        # known prices — same level checks tick() performs.
+        for p in self.positions:
+            if p.closed:
+                continue
+            px = self.last_prices.get(p.symbol)
+            if px is None:
+                continue
+            if p.side == "Long":
+                if p.remaining > 1e-9 and px >= p.tp1 and p.tp_taken == 0:
+                    self._close_fraction(p, 1, tg)
+                elif p.remaining > 1e-9 and px >= p.tp2 and p.tp_taken == 1:
+                    self._close_fraction(p, 2, tg)
+                elif p.remaining > 1e-9 and px >= p.tp3 and p.tp_taken == 2:
+                    self._close_fraction(p, 3, tg)
+                elif p.remaining > 1e-9 and px <= p.sl:
+                    self._market_close(p, tg, "SL")
+            else:
+                if p.remaining > 1e-9 and px <= p.tp1 and p.tp_taken == 0:
+                    self._close_fraction(p, 1, tg)
+                elif p.remaining > 1e-9 and px <= p.tp2 and p.tp_taken == 1:
+                    self._close_fraction(p, 2, tg)
+                elif p.remaining > 1e-9 and px <= p.tp3 and p.tp_taken == 2:
+                    self._close_fraction(p, 3, tg)
+                elif p.remaining > 1e-9 and px >= p.sl:
+                    self._market_close(p, tg, "SL")
         self._update_day_pnl()
         self.save()
 
@@ -683,9 +737,23 @@ class GateExecutor(Executor):
             self._notify_error(tg, pos.symbol, f"TP{tp_idx} close failed: {exc}")
             return
         lvl = (pos.tp1, pos.tp2, pos.tp3)[tp_idx - 1]
-        pnl = pos.bank_tp(frac, tp_idx - 1, lvl if lvl else (fill["price"] if fill else pos.entry))
+        # Book ONLY what the exchange actually filled (partial fills leave the
+        # remainder open — the next tick/bar retries it). Bank the plan-level
+        # gain on the filled fraction, minus the real exchange fee.
+        if fill is not None and fill["amount"] < frac_units - 1e-12:
+            filled_frac = frac * (fill["amount"] / frac_units) if frac_units > 0 else 0.0
+            self._notify_error(tg, pos.symbol,
+                               f"TP{tp_idx} partial fill {fill['amount']:.6g}/{frac_units:.6g} — "
+                               f"remainder stays open, retried next tick")
+        else:
+            filled_frac = frac
+        pnl = pos.bank_tp(filled_frac, tp_idx - 1, lvl if lvl else (fill["price"] if fill else pos.entry),
+                          advance=filled_frac >= frac - 1e-12)
         if fill is not None:
             pos.fill_ts = fill["ts"]
+            fee_usd = fill["fee"] * (fill["price"] if fill["price"] else pos.entry)
+            pos.realized -= fee_usd
+            pos.partial_ret -= fee_usd / pos.size if pos.size else 0.0
         if pos.remaining <= 1e-9:
             pos.close(f"TP{tp_idx}")
             self._notify_close(tg, pos, fill["price"] if fill else pos.entry, f"TP{tp_idx}", pnl)
@@ -701,15 +769,43 @@ class GateExecutor(Executor):
             self._notify_error(tg, pos.symbol, f"close ({reason}) failed: {exc}")
             return
         px = fill["price"] if fill else self.last_prices.get(pos.symbol, pos.entry)
-        if reason == "SL":
-            pnl = pos.bank_sl(px, level=pos.sl)
+        # Bank only what the exchange filled; the rest stays open.
+        if fill is not None and fill["amount"] < rem_units - 1e-12:
+            closed_frac = pos.remaining * (fill["amount"] / rem_units) if rem_units > 0 else 0.0
+            self._notify_error(tg, pos.symbol,
+                               f"close ({reason}) partial fill {fill['amount']:.6g}/{rem_units:.6g} — "
+                               f"remainder stays open")
         else:
-            pnl = pos.bank_price(pos.remaining, px)
-        pos.close(reason)
+            closed_frac = pos.remaining
+        if reason == "SL":
+            pnl = pos.bank_sl(px, level=pos.sl, frac=closed_frac)
+        else:
+            pnl = pos.bank_price(closed_frac, px)
         if fill is not None:
             pos.fill_ts = fill["ts"]
-        self._notify_close(tg, pos, px, reason, pnl)
+            fee_usd = fill["fee"] * (fill["price"] if fill["price"] else pos.entry)
+            pos.realized -= fee_usd
+            pos.partial_ret -= fee_usd / pos.size if pos.size else 0.0
+        if pos.remaining <= 1e-9:
+            pos.close(reason)
+            self._notify_close(tg, pos, px, reason, pnl)
+        else:
+            self._notify_error(tg, pos.symbol, f"close ({reason}) still has {pos.remaining:.1%} open — retried next tick")
         self.save()
+
+    def close_all(self) -> int:
+        """/flat on real money: submit actual market closes for every open
+        position (never book at last price). Partially-filled closes retry on
+        the next command poll."""
+        n = 0
+        for p in self.positions:
+            if p.closed:
+                continue
+            self._market_close(p, None, "flat")
+            n += 1
+        self._update_day_pnl()
+        self.save()
+        return n
 
     # -- notifications ------------------------------------------------------
 
