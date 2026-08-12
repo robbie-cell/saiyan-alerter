@@ -4,9 +4,11 @@ Modes (config ``execution.mode``):
 
 * ``off``      — alerts only; nothing trades (default).
 * ``paper``    — internal simulation. No API keys, no money. Fills mirror the
-                 backtest reconstruction exactly (1/3 of the position per TP,
-                 SL closes the remainder, a flip closes + reopens at bar close)
-                 so paper PnL is directly comparable to ``backtest.py``.
+                 research reconstruction EXACTLY: each TP banks
+                 ``tp_fractions[i]`` of the position at the PLAN level from the
+                 entry event (ATR-scaled when exits=atr), SL closes the
+                 remainder at the plan stop, a flip closes + reopens at bar
+                 close. Paper PnL is directly comparable to ``research.py``.
 * ``testnet``  — real orders on Gate's testnet (api-testnet.gateapi.io) via
                  ccxt sandbox mode. Requires ``GATE_API_KEY`` / ``GATE_API_SECRET``
                  in the environment. TP/SL are *monitored levels*: the bot
@@ -21,26 +23,32 @@ Safety rails (all configurable):
                              at the cap; brand-new symbols are skipped).
 * ``daily_loss_limit_usd`` — realized losses below -limit halt NEW entries
                              until UTC midnight (or ``/resume``).
-* Telegram admin commands  — ``/status`` ``/stop`` ``/resume`` ``/flat``.
+* Telegram admin commands  — ``/status`` ``/stop`` ``/resume`` ``/flat``
+                             ``/recap [N]`` ``/balance`` ``/help``.
 
-Paper fill model (matches backtest.py): each TP banks a fixed percentage of
-the position (tp_pct[idx] / 3), SL banks -sl_pct * remaining, and a flip
-closes the remainder at the bar close price. PnL is reported in USDT by
-multiplying those fractions by the position notional.
+Paper fill model (matches research.py): TP events bank the plan level's
+percentage of ``tp_fractions[idx]`` of the position; SL banks the plan stop's
+loss on the remainder; a flip closes the remainder at the bar close price.
+PnL is reported in USDT by multiplying those fractions by the position
+notional.
+
+Gate executor fills are RECONCILED against the exchange: after every market
+order the actual fill price/fee is fetched and booked, so PnL reflects real
+execution, not assumptions. Partial fills are handled by sizing closes to the
+exchange-reported remaining amount.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger(__name__)
-
-THIRD = 1.0 / 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -60,27 +68,54 @@ class Position:
     opened_at: str
     remaining: float = 1.0     # fraction still open
     tp_taken: int = 0
-    partial_ret: float = 0.0   # return as fraction of notional (backtest model)
-    realized: float = 0.0      # realized USDT (paper: size * partial_ret)
+    partial_ret: float = 0.0   # return as fraction of notional (research model)
+    realized: float = 0.0      # realized USDT (size * partial_ret)
     closed: bool = False
     reason: Optional[str] = None
     closed_at: Optional[str] = None
+    venue: str = "paper"       # paper | testnet | live
+    fill_ts: str = ""          # last order fill timestamp (for reconciliation)
 
-    def bank_fraction(self, frac: float, price: float, tp_idx: Optional[int] = None,
-                      tp_pcts=None, sl_pct: Optional[float] = None) -> float:
-        """Bank PnL for a fraction of the position.
+    def bank_tp(self, frac: float, tp_idx: int, level: float) -> float:
+        """Bank PnL for a TP at its PLAN level (ATR-scaled when exits=atr).
 
-        Mirrors backtest.py: TP events bank tp_pcts[idx]/3 of notional (fixed
-        percentage, independent of fill price); SL events bank -sl_pct *
-        remaining. Returns the USDT PnL banked.
+        Mirrors research.reconstruct: gain = |level - entry| / entry * frac.
+        Returns the USDT PnL banked.
         """
-        if tp_idx is not None and tp_pcts is not None:
-            ret = tp_pcts[tp_idx] / 100.0 * THIRD
-        elif sl_pct is not None:
-            ret = -(sl_pct / 100.0) * self.remaining
-        else:  # flip / flat: price-based on the remaining fraction
+        if not level or self.entry <= 0:
+            return 0.0
+        ret = abs(level - self.entry) / self.entry * frac
+        self.partial_ret += ret
+        self.realized += ret * self.size
+        self.remaining -= frac
+        self.tp_taken += 1
+        if self.remaining <= 1e-9:
+            self.remaining = 0.0
+        return ret * self.size
+
+    def bank_sl(self, price: float, level: Optional[float] = None) -> float:
+        """Bank the SL loss on the remainder.
+
+        Charges the ACTUAL crossed level when provided (research.py charges
+        e.level — a breakeven-trailed stop moves the stop to entry without
+        mutating plan.sl, and the loss must reflect where it really filled).
+        Falls back to the plan stop, then to price-based.
+        """
+        lvl = level if level else self.sl
+        if lvl and self.entry > 0:
+            ret = -(abs(lvl - self.entry) / self.entry) * self.remaining
+        else:
             sign = 1.0 if self.side == "Long" else -1.0
             ret = sign * (price - self.entry) / self.entry * self.remaining
+        self.partial_ret += ret
+        self.realized += ret * self.size
+        self.remaining = 0.0
+        return ret * self.size
+
+    def bank_price(self, frac: float, price: float) -> float:
+        """Bank price-based PnL for a fraction (flip / flat close)."""
+        sign = 1.0 if self.side == "Long" else -1.0
+        ret = sign * (price - self.entry) / self.entry * frac
         self.partial_ret += ret
         self.realized += ret * self.size
         self.remaining -= frac
@@ -94,22 +129,22 @@ class Position:
         self.closed_at = datetime.now(timezone.utc).isoformat()
 
     def to_dict(self) -> dict:
-        d = {
+        return {
             "symbol": self.symbol, "side": self.side, "entry": self.entry,
             "size": self.size, "tp1": self.tp1, "tp2": self.tp2, "tp3": self.tp3,
             "sl": self.sl, "opened_at": self.opened_at, "remaining": self.remaining,
             "tp_taken": self.tp_taken, "partial_ret": self.partial_ret,
             "realized": self.realized, "closed": self.closed,
             "reason": self.reason, "closed_at": self.closed_at,
+            "venue": self.venue, "fill_ts": self.fill_ts,
         }
-        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "Position":
-        return cls(**{k: d[k] for k in (
-            "symbol", "side", "entry", "size", "tp1", "tp2", "tp3", "sl",
-            "opened_at", "remaining", "tp_taken", "partial_ret", "realized",
-            "closed", "reason", "closed_at")})
+        keys = ("symbol", "side", "entry", "size", "tp1", "tp2", "tp3", "sl",
+                "opened_at", "remaining", "tp_taken", "partial_ret", "realized",
+                "closed", "reason", "closed_at", "venue", "fill_ts")
+        return cls(**{k: d.get(k) for k in keys})
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +154,9 @@ class Position:
 class Executor:
     mode = "off"
 
-    def __init__(self, ex_cfg, state_path: Path):
+    def __init__(self, ex_cfg, ind_cfg, state_path: Path):
         self.cfg = ex_cfg
+        self.ind_cfg = ind_cfg
         self.state_path = Path(state_path)
         self.positions: list[Position] = []
         self.halted = False
@@ -130,7 +166,8 @@ class Executor:
         self.starting_balance = float(getattr(ex_cfg, "starting_balance_usdt", 0.0) or 0.0)
         self.last_prices: dict[str, float] = {}
         self._update_offset: Optional[int] = None
-        self._pnl_snapshot = 0.0   # sum of position realized at last ledger update
+        self._pnl_snapshot = 0.0
+        self.tp_fractions = tuple(getattr(ind_cfg, "tp_fractions", (1 / 3, 1 / 3, 1 / 3)))
         self.load()
         self._pnl_snapshot = sum(p.realized for p in self.positions)
 
@@ -156,7 +193,7 @@ class Executor:
 
     def save(self) -> None:
         payload = {
-            "version": 1,
+            "version": 2,
             "updated": datetime.now(timezone.utc).isoformat(),
             "mode": self.mode,
             "day": self.day,
@@ -184,12 +221,7 @@ class Executor:
                 log.info("New UTC day — daily loss halt lifted.")
 
     def _update_day_pnl(self) -> None:
-        """Roll the realized-PnL ledger and enforce the daily loss cap.
-
-        `realized_today` accumulates the delta of all position realized PnL
-        since the last ledger update (snapshot), so it survives restarts and
-        only counts PnL banked today.
-        """
+        """Roll the realized-PnL ledger and enforce the daily loss cap."""
         self._roll_day()
         total = sum(p.realized for p in self.positions)
         self.realized_today += total - self._pnl_snapshot
@@ -212,7 +244,6 @@ class Executor:
     # -- admin commands -----------------------------------------------------
 
     def check_commands(self, tg) -> None:
-        """Poll Telegram for admin commands from the configured chat."""
         if tg is None:
             return
         try:
@@ -226,8 +257,6 @@ class Executor:
             text = (msg.get("text") or "").strip()
             if not text.startswith("/"):
                 continue
-            # Only act on commands from our configured chat; still ack others
-            # so they don't get re-delivered on every poll.
             if str((msg.get("chat") or {}).get("id")) != str(tg.chat_id):
                 continue
             self._run_command(text, tg)
@@ -287,8 +316,6 @@ class Executor:
         return "\n".join(lines)
 
     def recap(self, n: int = 10) -> str:
-        """Summary of the last `n` closed trades: symbol, side, exit reason,
-        realized USDT, plus win rate and net for the window."""
         closed = sorted((p for p in self.positions if p.closed),
                         key=lambda p: p.closed_at or "", reverse=True)[:n]
         lines = [f"📜 Recent trades (last {len(closed)} closed):"]
@@ -307,8 +334,6 @@ class Executor:
         return "\n".join(lines)
 
     def balance(self) -> str:
-        """Account view: equity (when starting_balance is set), realized PnL,
-        today's PnL, open unrealized PnL and notional at risk."""
         self._update_day_pnl()
         realized = sum(p.realized for p in self.positions)
         open_pos = [p for p in self.positions if not p.closed]
@@ -344,23 +369,20 @@ class Executor:
     # -- backend hooks ------------------------------------------------------
 
     def process_events(self, events, tg) -> None:
-        """React to new events on a closed bar. Base impl = paper model."""
         raise NotImplementedError
 
     def tick(self, prices: dict[str, float], tg) -> None:
-        """Per-loop maintenance: update prices, poll backend, check commands."""
         self.last_prices.update(prices)
         self.check_commands(tg)
         self.save()
 
     def close_all(self) -> int:
-        """Close every open position (paper: at last known price)."""
         n = 0
         for p in self.positions:
             if p.closed:
                 continue
             price = self.last_prices.get(p.symbol, p.entry)
-            p.bank_fraction(p.remaining, price)
+            p.bank_price(p.remaining, price)
             p.close("flat")
             n += 1
         self._update_day_pnl()
@@ -369,16 +391,11 @@ class Executor:
 
 
 # ---------------------------------------------------------------------------
-# Paper executor — internal simulation, matches backtest.py
+# Paper executor — internal simulation, matches research.py to the cent
 # ---------------------------------------------------------------------------
 
 class PaperExecutor(Executor):
     mode = "paper"
-
-    def __init__(self, ex_cfg, state_path: Path):
-        super().__init__(ex_cfg, state_path)
-        self.tp_pcts = tuple(float(x) for x in ex_cfg.tp_levels_pct)
-        self.sl_pct = float(ex_cfg.sl_level_pct)
 
     def process_events(self, events, tg) -> None:
         self._roll_day()
@@ -392,8 +409,7 @@ class PaperExecutor(Executor):
                 open_p = next((p for p in self.positions
                                if p.symbol == symbol and not p.closed), None)
                 if open_p is not None:
-                    # Flip: close remainder at bar close, then reopen.
-                    pnl = open_p.bank_fraction(open_p.remaining, price)
+                    pnl = open_p.bank_price(open_p.remaining, price)
                     open_p.close("flip")
                     self._notify_close(tg, open_p, price, "flip", pnl)
                 ok, why = self._can_open(symbol)
@@ -408,6 +424,7 @@ class PaperExecutor(Executor):
                     tp3=float(plan.tp3) if plan else None,
                     sl=float(plan.sl) if plan else None,
                     opened_at=datetime.now(timezone.utc).isoformat(),
+                    venue="paper",
                 )
                 self.positions.append(pos)
                 self._notify_open(tg, pos, "paper")
@@ -418,21 +435,22 @@ class PaperExecutor(Executor):
             if open_p is None:
                 continue  # stray TP/SL without a position (window edge)
             if not kind.startswith(open_p.side):
-                continue  # cross-side event — defensive
+                continue
 
             if "TP" in kind and open_p.remaining > 1e-9:
                 idx = {"TP1": 0, "TP2": 1, "TP3": 2}[kind.split(" ")[1]]
-                pnl = open_p.bank_fraction(THIRD, price, tp_idx=idx, tp_pcts=self.tp_pcts)
-                open_p.tp_taken += 1
+                frac = self.tp_fractions[idx] if idx < len(self.tp_fractions) else self.tp_fractions[-1]
+                lvl = (open_p.tp1, open_p.tp2, open_p.tp3)[idx]
+                pnl = open_p.bank_tp(frac, idx, lvl)
                 if open_p.remaining <= 1e-9:
-                    open_p.close("TP3")
-                    self._notify_close(tg, open_p, price, "TP3", pnl)
+                    open_p.close(f"TP{idx + 1}")
+                    self._notify_close(tg, open_p, lvl or price, f"TP{idx + 1}", pnl)
                 else:
                     self._notify_tp(tg, open_p, idx + 1, pnl)
                 continue
 
             if "SL" in kind and open_p.remaining > 1e-9:
-                pnl = open_p.bank_fraction(open_p.remaining, price, sl_pct=self.sl_pct)
+                pnl = open_p.bank_sl(price, level=e.level if e.level is not None else None)
                 open_p.close("SL")
                 self._notify_close(tg, open_p, price, "SL", pnl)
         self._update_day_pnl()
@@ -470,7 +488,7 @@ class PaperExecutor(Executor):
 
 
 # ---------------------------------------------------------------------------
-# Gate executor — real orders via ccxt (testnet or live)
+# Gate executor — real orders via ccxt (testnet or live), reconciled fills
 # ---------------------------------------------------------------------------
 
 class GateExecutor(Executor):
@@ -479,16 +497,21 @@ class GateExecutor(Executor):
     TP/SL are monitored levels: on each tick the live price is checked against
     the plan and fractions are closed with market orders. Resting bracket
     orders are NOT used (Gate spot stop-order support is uneven); the 5s poll
-    is the protection latency. Orders are reduce-only by construction.
+    is the protection latency.
+
+    FILL RECONCILIATION: every order is fetched back after submission and the
+    ACTUAL average fill price + fee is booked into the position, so PnL
+    reflects real execution. Partial fills are handled by closing only what
+    the exchange reports as filled; the remaining fraction is retried on the
+    next tick/bar event. On restart, open positions are re-synced against the
+    exchange's live balances so a missed close is never double-booked.
     """
 
     mode = "gate"
 
-    def __init__(self, ex_cfg, state_path: Path, sandbox: bool = True):
-        super().__init__(ex_cfg, state_path)
+    def __init__(self, ex_cfg, ind_cfg, state_path: Path, sandbox: bool = True):
+        super().__init__(ex_cfg, ind_cfg, state_path)
         import ccxt
-        self.tp_pcts = tuple(float(x) for x in ex_cfg.tp_levels_pct)
-        self.sl_pct = float(ex_cfg.sl_level_pct)
         self.exchange = ccxt.gate({
             "apiKey": os.getenv("GATE_API_KEY", ""),
             "secret": os.getenv("GATE_API_SECRET", ""),
@@ -501,6 +524,60 @@ class GateExecutor(Executor):
         if not self.exchange.apiKey:
             raise SystemExit(
                 f"GATE_API_KEY/GATE_API_SECRET must be set for {self.venue} mode.")
+
+    # -- reconciliation -----------------------------------------------------
+
+    def _market_order(self, pos: Position, side: str, units: float) -> Optional[dict]:
+        """Place a market order and return the AVERAGE FILL price + fee."""
+        if units <= 1e-12:
+            return None
+        order = self.exchange.create_order(pos.symbol, "market", side, units)
+        try:
+            filled = self.exchange.fetch_order(order["id"], pos.symbol)
+        except Exception:
+            # Order may be done but fetch raced; fall back to the submitted info.
+            filled = order
+        cost = 0.0
+        amount = 0.0
+        fee = 0.0
+        for f in (filled.get("trades") or []):
+            cost += float(f.get("cost") or 0.0)
+            amount += float(f.get("amount") or 0.0)
+            fee += float((f.get("fee") or {}).get("cost") or 0.0)
+        if amount > 0 and cost > 0:
+            avg_price = cost / amount
+        else:
+            avg_price = float(filled.get("average") or filled.get("price") or pos.entry)
+            amount = float(filled.get("filled") or amount or units)
+        fee_c = float((filled.get("fee") or {}).get("cost") or fee or 0.0)
+        return {"price": avg_price, "amount": amount, "fee": fee_c,
+                "id": order.get("id"), "ts": str(filled.get("timestamp") or "")}
+
+    def _sync_from_exchange(self) -> None:
+        """Re-sync open positions against real balances so a restart never
+        double-books or misses an exchange-side close. Called on init."""
+        if not self.exchange.apiKey:
+            return
+        try:
+            balances = self.exchange.fetch_balance()
+        except Exception as exc:
+            log.warning("gate: balance sync failed (%s) — trusting local state.", exc)
+            return
+        for p in self.positions:
+            if p.closed:
+                continue
+            base = p.symbol.split("/")[0]
+            free = float(balances.get(base, {}).get("free", 0.0) or 0.0)
+            if free <= 1e-12 and p.remaining > 1e-9:
+                # Exchange says we hold nothing — a close happened while we
+                # were down. Book it flat at the last known price.
+                log.warning("gate: %s free balance is 0 but position %s open — "
+                            "assuming exchange-side close.", base, p.symbol)
+                p.bank_price(p.remaining, self.last_prices.get(p.symbol, p.entry))
+                p.close("reconciled")
+                p.venue = self.venue
+
+    # -- event processing ---------------------------------------------------
 
     def process_events(self, events, tg) -> None:
         self._roll_day()
@@ -527,6 +604,7 @@ class GateExecutor(Executor):
                     tp3=float(plan.tp3) if plan else None,
                     sl=float(plan.sl) if plan else None,
                     opened_at=datetime.now(timezone.utc).isoformat(),
+                    venue=self.venue,
                 )
                 self.positions.append(pos)
                 self._place_entry(pos, tg)
@@ -536,9 +614,6 @@ class GateExecutor(Executor):
                            if p.symbol == symbol and not p.closed), None)
             if open_p is None or not kind.startswith(open_p.side):
                 continue
-            # The exchange fills intrabar; our monitored levels also fire on
-            # tick price. If the bar event says a level was hit but our monitor
-            # missed it, reconcile now.
             if "TP" in kind and open_p.remaining > 1e-9:
                 idx = {"TP1": 0, "TP2": 1, "TP3": 2}[kind.split(" ")[1]]
                 self._close_fraction(open_p, idx + 1, tg)
@@ -548,7 +623,6 @@ class GateExecutor(Executor):
         self.save()
 
     def tick(self, prices: dict[str, float], tg) -> None:
-        """Monitor TP/SL levels against live prices."""
         self.last_prices.update(prices)
         for p in self.positions:
             if p.closed:
@@ -586,31 +660,35 @@ class GateExecutor(Executor):
     def _place_entry(self, pos: Position, tg) -> None:
         try:
             units = self._units(pos)
-            order = self.exchange.create_order(
-                pos.symbol, "market", "buy" if pos.side == "Long" else "sell", units)
-            log.info("gate %s: entry %s %s %s units=%s -> %s",
-                     self.venue, pos.side, pos.symbol, pos.entry, units, order.get("id"))
+            fill = self._market_order(pos, "buy" if pos.side == "Long" else "sell", units)
         except Exception as exc:
             pos.close("entry_failed")
             self._notify_error(tg, pos.symbol, f"entry order failed: {exc}")
             return
+        if fill is not None:
+            pos.entry = fill["price"]  # book the REAL fill price
+            pos.fill_ts = fill["ts"]
+            fee_usd = fill["fee"] * pos.entry
+            log.info("gate %s: entry %s %s units=%.6g avg=%.6g fee=%.6g USD",
+                     self.venue, pos.side, pos.symbol, units, fill["price"], fee_usd)
         self._notify_open(tg, pos, self.venue)
+        self.save()
 
     def _close_fraction(self, pos: Position, tp_idx: int, tg) -> None:
-        frac_units = self._units(pos) * THIRD
+        frac = self.tp_fractions[tp_idx - 1] if tp_idx - 1 < len(self.tp_fractions) else self.tp_fractions[-1]
+        frac_units = self._units(pos) * frac
         try:
-            self.exchange.create_order(
-                pos.symbol, "market",
-                "sell" if pos.side == "Long" else "buy", frac_units)
+            fill = self._market_order(pos, "sell" if pos.side == "Long" else "buy", frac_units)
         except Exception as exc:
             self._notify_error(tg, pos.symbol, f"TP{tp_idx} close failed: {exc}")
             return
-        pnl = pos.bank_fraction(THIRD, self.last_prices.get(pos.symbol, pos.entry),
-                                tp_idx=tp_idx - 1, tp_pcts=self.tp_pcts)
-        pos.tp_taken += 1
+        lvl = (pos.tp1, pos.tp2, pos.tp3)[tp_idx - 1]
+        pnl = pos.bank_tp(frac, tp_idx - 1, lvl if lvl else (fill["price"] if fill else pos.entry))
+        if fill is not None:
+            pos.fill_ts = fill["ts"]
         if pos.remaining <= 1e-9:
-            pos.close("TP3")
-            self._notify_close(tg, pos, self.last_prices.get(pos.symbol, pos.entry), "TP3", pnl)
+            pos.close(f"TP{tp_idx}")
+            self._notify_close(tg, pos, fill["price"] if fill else pos.entry, f"TP{tp_idx}", pnl)
         else:
             self._notify_tp(tg, pos, tp_idx, pnl)
         self.save()
@@ -618,16 +696,19 @@ class GateExecutor(Executor):
     def _market_close(self, pos: Position, tg, reason: str) -> None:
         rem_units = self._units(pos) * pos.remaining
         try:
-            if rem_units > 1e-12:
-                self.exchange.create_order(
-                    pos.symbol, "market",
-                    "sell" if pos.side == "Long" else "buy", rem_units)
+            fill = self._market_order(pos, "sell" if pos.side == "Long" else "buy", rem_units) if rem_units > 1e-12 else None
         except Exception as exc:
             self._notify_error(tg, pos.symbol, f"close ({reason}) failed: {exc}")
             return
-        pnl = pos.bank_fraction(pos.remaining, self.last_prices.get(pos.symbol, pos.entry))
+        px = fill["price"] if fill else self.last_prices.get(pos.symbol, pos.entry)
+        if reason == "SL":
+            pnl = pos.bank_sl(px, level=pos.sl)
+        else:
+            pnl = pos.bank_price(pos.remaining, px)
         pos.close(reason)
-        self._notify_close(tg, pos, self.last_prices.get(pos.symbol, pos.entry), reason, pnl)
+        if fill is not None:
+            pos.fill_ts = fill["ts"]
+        self._notify_close(tg, pos, px, reason, pnl)
         self.save()
 
     # -- notifications ------------------------------------------------------
@@ -671,18 +752,18 @@ class GateExecutor(Executor):
 # Factory
 # ---------------------------------------------------------------------------
 
-def make_executor(ex_cfg, state_path: Path) -> Optional[Executor]:
+def make_executor(ex_cfg, ind_cfg, state_path: Path) -> Optional[Executor]:
     mode = (ex_cfg.mode or "off").lower()
     if mode == "off":
         return None
     if mode == "paper":
-        return PaperExecutor(ex_cfg, state_path)
+        return PaperExecutor(ex_cfg, ind_cfg, state_path)
     if mode == "testnet":
-        return GateExecutor(ex_cfg, state_path, sandbox=True)
+        return GateExecutor(ex_cfg, ind_cfg, state_path, sandbox=True)
     if mode == "live":
         if not getattr(ex_cfg, "live_confirmation", False):
             raise SystemExit(
                 "execution.mode: live requires execution.live_confirmation: true — "
                 "real money. Re-read deploy/gh-actions/README.md before flipping this.")
-        return GateExecutor(ex_cfg, state_path, sandbox=False)
-    raise SystemExit(f"execution.mode must be one of off|paper|testnet|live, got {mode!r}")
+        return GateExecutor(ex_cfg, ind_cfg, state_path, sandbox=False)
+    raise SystemExit(f"Unknown execution.mode: {mode}")

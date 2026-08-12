@@ -559,7 +559,7 @@ def run_live(cfg: RuntimeConfig, once: bool = False, focus_pair: Optional[str] =
     health = PairHealth()
 
     # Automatic execution (paper/testnet/live). `off` (default) = alerts only.
-    executor = make_executor(cfg.execution, Path("execution_state.json")) \
+    executor = make_executor(cfg.execution, cfg.cfg, Path("execution_state.json")) \
         if cfg.execution and cfg.execution.mode != "off" else None
 
     # Hugging Face Spaces: keep-alive + platform health checks need an HTTP
@@ -707,7 +707,7 @@ def run_check(cfg: RuntimeConfig, args) -> int:
     executor = None
     if not dry_run and args.exec_state:
         try:
-            executor = make_executor(cfg.execution, Path(args.exec_state))
+            executor = make_executor(cfg.execution, cfg.cfg, Path(args.exec_state))
         except Exception as exc:
             log.exception("Executor init failed: %s", exc)
         if executor is not None:

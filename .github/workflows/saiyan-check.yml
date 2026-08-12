@@ -96,15 +96,19 @@ jobs:
         # Exit 1 (job goes red) if any pair failed — the next scheduled run
         # retries those pairs. State for successful pairs is already advanced,
         # so nothing is re-sent.
-        # Alerts-only: execution is disabled (config.yaml execution.mode: off),
-        # so no --exec-state flag and no exec-state artifact. Flip mode to
-        # paper/testnet/live and add `--exec-state state/saiyan_exec_state.json`
-        # here to re-enable the cloud auto-trader.
-        run: python main.py check --state state/saiyan_state.json --ledger state/saiyan_ledger.json
+        # Execution: config.yaml execution.mode is `paper` by default, so each
+        # run also feeds the new closed-bar events to the paper executor
+        # (--exec-state state/saiyan_exec_state.json). Its state — open
+        # positions, daily PnL, halt flag, command offset — rides the same
+        # artifact, giving a 24/7 cloud paper-trader with the Telegram admin
+        # command suite (/status /recap /balance /stop /resume /flat /help).
+        # For testnet/live, mode: testnet|live + the two GATE_* secrets (never
+        # in the repo) — see deploy/gh-actions/README.md.
+        run: python main.py check --state state/saiyan_state.json --ledger state/saiyan_ledger.json --exec-state state/saiyan_exec_state.json
 
       - name: Upload state + ledger for the next run
         uses: actions/upload-artifact@v4
         with:
           name: saiyan-state
-          path: state/          # saiyan_state.json + saiyan_ledger.json
+          path: state/          # saiyan_state.json + saiyan_ledger.json + saiyan_exec_state.json
           if-no-files-found: error

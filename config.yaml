@@ -127,7 +127,35 @@ quiet_hours: null
 timezone: Australia/Melbourne
 
 # ---------------------------------------------------------------------------
-# Automatic execution has been REMOVED — this bot is alerts-only.
-# The executor code still lives in the repo (executor.py) for a potential
-# future phase; see git history for how it was wired up.
+# Automatic execution (executor.py) — SAFE DEFAULTS, paper by default.
+#
+#   mode: off      — alerts only; nothing trades.
+#   mode: paper    — internal simulation, $0, no keys. Fills mirror the
+#                    research reconstruction exactly (ATR plan levels +
+#                    tp_fractions), so paper PnL == backtest PnL per trade.
+#   mode: testnet  — REAL orders on Gate's TESTNET (api-testnet.gateapi.io).
+#                    Needs GATE_API_KEY / GATE_API_SECRET in .env.
+#   mode: live     — REAL MONEY on Gate mainnet. Requires live_confirmation:
+#                    true AND your real keys in .env. This is the last step;
+#                    run paper, then testnet, then read the deploy README
+#                    before ever flipping this.
+#
+# Safety rails apply in every mode: size_usdt notional per entry,
+# max_positions cap, daily_loss_limit_usd halts new entries below the cap
+# (lifted at UTC midnight or /resume), quiet_pause stops trading during
+# quiet_hours, and Telegram admin commands /status /recap /balance /stop
+# /resume /flat /help are chat-filtered.
+#
+# The GitHub cron runs the paper executor when mode is paper/testnet/live
+# (it needs the --exec-state artifact step in saiyan-check.yml — see the
+# deploy README). Paper state rides the saiyan-exec-state artifact between
+# runs. NEVER put testnet/live keys in the repo — .env is gitignored.
 # ---------------------------------------------------------------------------
+execution:
+  mode: paper               # off | paper | testnet | live
+  size_usdt: 200.0          # notional per entry (top-3 portfolio sizing)
+  max_positions: 3
+  daily_loss_limit_usd: 50.0
+  quiet_pause: true         # don't open new trades during quiet_hours
+  live_confirmation: false  # must be true for mode: live (real money)
+  starting_balance_usdt: 600.0   # display-only equity baseline for /balance
