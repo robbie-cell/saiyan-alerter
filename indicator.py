@@ -86,6 +86,24 @@ class IndicatorConfig:
     tp_levels_pct: Tuple[float, float, float] = (1.0, 1.5, 2.0)
     sl_level_pct: float = 0.5
     trade_type: str = "BOTH"  # LONG / SHORT / BOTH / NONE
+    # Exit engineering: "fixed" (percentage levels above) or "atr" (levels
+    # scaled by ATR at entry: SL = k_sl*ATR, TPs = k_tp*ATR — adaptive to
+    # volatility, so a stop is never too tight in a spike nor too wide in
+    # dead chop). Falls back to fixed levels if ATR is not yet finite.
+    exits: str = "fixed"   # fixed | atr | atr_trail
+    atr_len: int = 14
+    sl_atr_mult: float = 1.0
+    tp_atr_mults: Tuple[float, float, float] = (2.0, 3.0, 4.0)
+    # Fraction of the position banked at each TP (sums to 1). Researched in
+    # research_sizing.py: 1/4-1/4-1/2 (hold more for TP3) beats 1/3-1/3-1/3 on
+    # both windows (gate90d +102.5% vs +98.5%, bin6mo +217.1% vs +209.5%).
+    tp_fractions: Tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3)
+    # atr_trail only: after TP1 banks its third, the remainder trails the
+    # running extreme by trail_atr_mult * ATR (ratcheting, never loosening).
+    trail_atr_mult: float = 2.0
+    # After TP1 fills, move the stop to breakeven so the remaining two-thirds
+    # can never turn into a loss.
+    breakeven_after_tp1: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +403,7 @@ def run_indicator(df: pd.DataFrame, cfg: IndicatorConfig, symbol: str = "?",
     # the next entry; left intact across TP walks so a TP1 cross still shows the
     # TP2/TP3/SL targets that haven't fired yet.
     current_plan: Optional[Plan] = None
+    trail_extreme: Optional[float] = None  # atr_trail running extreme
 
     opens  = df["open"].to_numpy(dtype=float)
     highs  = df["high"].to_numpy(dtype=float)
@@ -393,6 +412,14 @@ def run_indicator(df: pd.DataFrame, cfg: IndicatorConfig, symbol: str = "?",
     # Pre-shift high/low into "previous bar" arrays for fast cross checks
     prev_highs = np.concatenate([[np.nan], highs[:-1]])
     prev_lows  = np.concatenate([[np.nan], lows[:-1]])
+
+    # ATR for adaptive (exits="atr") levels — SMA of true range, same formula
+    # as the filter stack's volatility context.
+    atr = None
+    if cfg.exits in ("atr", "atr_trail"):
+        pc = np.concatenate([[closes[0]], closes[:-1]])
+        tr = np.maximum.reduce([highs - lows, np.abs(highs - pc), np.abs(lows - pc)])
+        atr = pd.Series(tr).rolling(cfg.atr_len, min_periods=cfg.atr_len).mean().to_numpy()
 
     is_long  = cfg.trade_type in ("LONG", "BOTH")
     is_short = cfg.trade_type in ("SHORT", "BOTH")
@@ -425,18 +452,30 @@ def run_indicator(df: pd.DataFrame, cfg: IndicatorConfig, symbol: str = "?",
         # Update entry / SL / TP lines from current bar
         if le_ok:
             entry_i = closes[i]
-            sl_i    = entry_i * (1 - cfg.sl_level_pct / 100.0)
-            tp1_i   = entry_i * (1 + cfg.tp_levels_pct[0] / 100.0)
-            tp2_i   = entry_i * (1 + cfg.tp_levels_pct[1] / 100.0)
-            tp3_i   = entry_i * (1 + cfg.tp_levels_pct[2] / 100.0)
+            if cfg.exits in ("atr", "atr_trail") and atr is not None and np.isfinite(atr[i]):
+                sl_i  = entry_i - cfg.sl_atr_mult * atr[i]
+                tp1_i = entry_i + cfg.tp_atr_mults[0] * atr[i]
+                tp2_i = entry_i + cfg.tp_atr_mults[1] * atr[i]
+                tp3_i = entry_i + cfg.tp_atr_mults[2] * atr[i]
+            else:
+                sl_i  = entry_i * (1 - cfg.sl_level_pct / 100.0)
+                tp1_i = entry_i * (1 + cfg.tp_levels_pct[0] / 100.0)
+                tp2_i = entry_i * (1 + cfg.tp_levels_pct[1] / 100.0)
+                tp3_i = entry_i * (1 + cfg.tp_levels_pct[2] / 100.0)
             current_plan = Plan(side="Long", entry_price=entry_i,
                                 tp1=tp1_i, tp2=tp2_i, tp3=tp3_i, sl=sl_i)
         elif se_ok:
             entry_i = closes[i]
-            sl_i    = entry_i * (1 + cfg.sl_level_pct / 100.0)
-            tp1_i   = entry_i * (1 - cfg.tp_levels_pct[0] / 100.0)
-            tp2_i   = entry_i * (1 - cfg.tp_levels_pct[1] / 100.0)
-            tp3_i   = entry_i * (1 - cfg.tp_levels_pct[2] / 100.0)
+            if cfg.exits in ("atr", "atr_trail") and atr is not None and np.isfinite(atr[i]):
+                sl_i  = entry_i + cfg.sl_atr_mult * atr[i]
+                tp1_i = entry_i - cfg.tp_atr_mults[0] * atr[i]
+                tp2_i = entry_i - cfg.tp_atr_mults[1] * atr[i]
+                tp3_i = entry_i - cfg.tp_atr_mults[2] * atr[i]
+            else:
+                sl_i  = entry_i * (1 + cfg.sl_level_pct / 100.0)
+                tp1_i = entry_i * (1 - cfg.tp_levels_pct[0] / 100.0)
+                tp2_i = entry_i * (1 - cfg.tp_levels_pct[1] / 100.0)
+                tp3_i = entry_i * (1 - cfg.tp_levels_pct[2] / 100.0)
             current_plan = Plan(side="Short", entry_price=entry_i,
                                 tp1=tp1_i, tp2=tp2_i, tp3=tp3_i, sl=sl_i)
         else:
@@ -445,6 +484,29 @@ def run_indicator(df: pd.DataFrame, cfg: IndicatorConfig, symbol: str = "?",
             tp1_i   = tp1_val
             tp2_i   = tp2_val
             tp3_i   = tp3_val
+
+        # Trailing stop (exits="atr_trail"): ratchet the stop behind the
+        # running extreme. Runs after the line update so the entry bar itself
+        # seeds the extreme; from the NEXT bar onward the stop tightens with
+        # favorable highs/lows and never loosens. Fixed TP2/TP3 are disabled —
+        # the remainder exits on the trailing SL (whose e.level is the trail
+        # price, so reconstruction is exact).
+        if cfg.exits == "atr_trail" and atr is not None:
+            if le_ok:
+                trail_extreme = entry_i
+            elif se_ok:
+                trail_extreme = entry_i
+            elif state == 1.1 and np.isfinite(atr[i]):
+                # Only AFTER TP1 banks its third does the remainder trail.
+                trail_extreme = max(trail_extreme, highs[i])
+                trail_stop = trail_extreme - cfg.trail_atr_mult * atr[i]
+                sl_i = max(sl_i, trail_stop) if np.isfinite(sl_i) else trail_stop
+                tp2_i = tp3_i = np.nan
+            elif state == -1.1 and np.isfinite(atr[i]):
+                trail_extreme = min(trail_extreme, lows[i])
+                trail_stop = trail_extreme + cfg.trail_atr_mult * atr[i]
+                sl_i = min(sl_i, trail_stop) if np.isfinite(sl_i) else trail_stop
+                tp2_i = tp3_i = np.nan
 
         # Cross checks
         def crossed(prev_, cur_, level_prev, level_cur):
@@ -485,6 +547,13 @@ def run_indicator(df: pd.DataFrame, cfg: IndicatorConfig, symbol: str = "?",
                 entry_filter.mark_tp(i)
             if new_state == 0.0 and ((sl_long and state >= 1.0) or (sl_short and state <= -1.0)):
                 entry_filter.mark_sl(i)
+
+        # Exit engineering: after TP1 banks its third, move the stop to
+        # breakeven so the remaining exposure cannot turn into a loss. Applies
+        # from the NEXT bar (sl_i feeds sl_val at the loop tail).
+        if cfg.breakeven_after_tp1 and current_plan is not None:
+            if (state ==  1.0 and new_state ==  1.1) or (state == -1.0 and new_state == -1.1):
+                sl_i = current_plan.entry_price
 
         evt_time = df.index[i]
         # Emit events in switch-priority order (a single bar yields at most one event).

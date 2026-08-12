@@ -110,6 +110,18 @@ def load_config(path: Path = DEFAULT_CFG_PATH) -> RuntimeConfig:
     if not (isinstance(tp_levels, list) and len(tp_levels) == 3):
         raise ValueError("`tp_levels_pct` must be a list of exactly three numbers, e.g. [1.0, 1.5, 2.0].")
 
+    # Exit engineering (research_exits.py iteration 1): ATR-adaptive levels +
+    # breakeven trail. Read from the nested `indicator.exits:` dict.
+    exit_cfg = ind.get("exits") or {}
+    if isinstance(exit_cfg, str):
+        exit_cfg = {"mode": exit_cfg}
+    exits_mode = str(exit_cfg.get("mode", "fixed")).lower()
+    if exits_mode not in ("fixed", "atr"):
+        raise ValueError("`indicator.exits.mode` must be 'fixed' or 'atr'.")
+    tp_atr = exit_cfg.get("tp_atr_mults", [2.0, 3.0, 4.0])
+    if not (isinstance(tp_atr, list) and len(tp_atr) == 3):
+        raise ValueError("`indicator.exits.tp_atr_mults` must be a list of exactly three numbers.")
+
     cfg = IndicatorConfig(
         ma_type=str(ind.get("ma_type", "ALMA")),
         basis_len=int(ind.get("basis_len", 2)),
@@ -123,6 +135,13 @@ def load_config(path: Path = DEFAULT_CFG_PATH) -> RuntimeConfig:
         tp_levels_pct=tuple(float(x) for x in tp_levels),
         sl_level_pct=float(ind.get("sl_level_pct", 0.5)),
         trade_type=str(ind.get("trade_type", "BOTH")),
+        exits=exits_mode,
+        atr_len=int(exit_cfg.get("atr_len", 14)),
+        sl_atr_mult=float(exit_cfg.get("sl_atr_mult", 1.0)),
+        tp_atr_mults=tuple(float(x) for x in tp_atr),
+        breakeven_after_tp1=bool(exit_cfg.get("breakeven_after_tp1", False)),
+        trail_atr_mult=float(exit_cfg.get("trail_atr_mult", 2.0)),
+        tp_fractions=tuple(float(x) for x in exit_cfg.get("tp_fractions", [1 / 3, 1 / 3, 1 / 3])),
     )
 
     quiet_hours = raw.get("quiet_hours")

@@ -43,9 +43,31 @@ indicator:
   chart_timeframe_min: 15  # 15-minute candles on the LTF
   delay_offset: 0
   heikin_ashi: false
-  tp_levels_pct: [1.0, 1.5, 2.0]
-  sl_level_pct: 0.5
+  tp_levels_pct: [1.0, 1.5, 2.0]   # (unused when exits.mode = atr — kept for fixed mode)
+  sl_level_pct: 0.5                # (unused when exits.mode = atr)
   trade_type: BOTH         # LONG / SHORT / BOTH / NONE
+
+  # Exit engineering — researched in research_exits.py (iteration 1).
+  # ATR-scaled stops/targets + a breakeven trail beat fixed percentages on
+  # BOTH the Gate 90d window (PF 4.83 vs 4.32, +98.5% vs +77.6%, maxDD 2.24%
+  # vs 2.46%) and the out-of-sample Binance 6mo window (PF 4.17 vs 3.23,
+  # +209.5% vs +146.2%, win 71.4% vs 62.1%). Wider (2.25/2.5) and tighter
+  # (1.0/1.5) multiples tested worse on risk-adjusted terms; the 2.0/4-6-8
+  # point is the plateau. PAXG (not live) degrades under ATR exits — re-check
+  # before ever re-adding gold.
+  exits:
+    mode: atr               # fixed | atr | atr_trail
+    atr_len: 14             # SMA of true range (bars)
+    sl_atr_mult: 2.25       # stop = 2.25 * ATR below/above entry
+    tp_atr_mults: [5.0, 7.5, 10.0]  # TP1/2/3 in ATR multiples
+    # Fraction banked at each TP. Sensitivity research (research_sizing.py +
+    # research_sensitivity.py + research_final.py) converged on holding MORE
+    # for the outer targets: (0.15, 0.25, 0.6) beat flat thirds on both
+    # windows (+120.4%/+256.5% vs +98.5%/+209.5%, PF 6.52/5.30 vs 4.83/4.17).
+    tp_fractions: [0.15, 0.25, 0.6]
+    breakeven_after_tp1: false  # researched: BE cut PF (4.95->6.34 on the 90d
+                                # window) by stopping out runners early — with
+                                # a 2.25 ATR stop the protection is redundant
 
 # ---------------------------------------------------------------------------
 # Institutional filter stack (filters.py) — the confluence layer on top of the

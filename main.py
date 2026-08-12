@@ -866,6 +866,7 @@ def _reconstruct_trades(events: list, cfg: IndicatorConfig):
     """
     tp_pcts = cfg.tp_levels_pct
     sl_pct = cfg.sl_level_pct
+    tp_fracs = tuple(cfg.tp_fractions)
     trades = []
     open_trade = None
 
@@ -877,8 +878,14 @@ def _reconstruct_trades(events: list, cfg: IndicatorConfig):
         trades.append({
             "entry_time": t["t0"], "exit_time": exit_time, "side": t["side"],
             "ret": ret, "reason": reason, "entry_price": t["entry"],
+            "exit_price": exit_price, "risk_pct": t.get("risk_pct", sl_pct / 100.0),
         })
         open_trade = None
+
+    def _tp_level(e, idx):
+        if e.plan is not None:
+            return (e.plan.tp1, e.plan.tp2, e.plan.tp3)[idx]
+        return None
 
     for e in events:
         kind = e.kind
@@ -887,22 +894,35 @@ def _reconstruct_trades(events: list, cfg: IndicatorConfig):
             side = "Long" if kind.startswith("Long") else "Short"
             if open_trade is not None:
                 finish(price, e.time, "flip")
+            sl = e.plan.sl if e.plan is not None else None
+            risk = (abs(sl - price) / price) if sl else (sl_pct / 100.0)
             open_trade = {"side": side, "entry": price, "remaining": 1.0,
-                          "tp_taken": 0, "partial_ret": 0.0, "t0": e.time}
+                          "tp_taken": 0, "partial_ret": 0.0, "t0": e.time,
+                          "risk_pct": risk}
             continue
         if open_trade is None or not kind.startswith(open_trade["side"]):
             continue  # stray management event (e.g. SL-after-TP3 state quirk) — ignore
         if "TP" in kind and open_trade["remaining"] > 1e-9:
             idx = {"TP1": 0, "TP2": 1, "TP3": 2}[kind.split(" ")[1]]
-            gain = tp_pcts[idx] / 100.0 * (1.0 / 3.0)
+            frac = tp_fracs[idx] if idx < len(tp_fracs) else tp_fracs[-1]
+            lvl = _tp_level(e, idx)
+            if lvl is not None:
+                gain = abs(lvl - open_trade["entry"]) / open_trade["entry"] * frac
+            else:
+                gain = tp_pcts[idx] / 100.0 * frac
             open_trade["tp_taken"] += 1
             open_trade["partial_ret"] += gain
-            open_trade["remaining"] -= 1.0 / 3.0
+            open_trade["remaining"] -= frac
             if open_trade["remaining"] <= 1e-9:
-                finish(price, e.time, "TP3")
+                finish(price, e.time, f"TP{idx + 1}")
             continue
         if "SL" in kind and open_trade["remaining"] > 1e-9:
-            open_trade["partial_ret"] += -(sl_pct / 100.0) * open_trade["remaining"]
+            # Use the event's ACTUAL crossed level (breakeven trail after TP1
+            # adjusts the stop without mutating plan.sl) so the ledger books the
+            # real outcome, not the original stop distance.
+            lvl = e.level if e.level is not None else (e.plan.sl if e.plan is not None else None)
+            loss_pct = (abs(lvl - open_trade["entry"]) / open_trade["entry"]) if lvl else (sl_pct / 100.0)
+            open_trade["partial_ret"] += -loss_pct * open_trade["remaining"]
             open_trade["remaining"] = 0.0
             finish(price, e.time, "SL")
     return trades, open_trade
@@ -957,7 +977,11 @@ class SignalLedger:
             key = (symbol, t["entry_time"].isoformat())
             if key in seen:
                 continue
-            r = t["ret"] / (cfg.sl_level_pct / 100.0)
+            entry = float(t["entry_price"])
+            # R = net / PLANNED risk (entry plan SL distance) — same definition
+            # as research.py reconstruct(), so the ledger matches the backtest.
+            risk = float(t.get("risk_pct", 0.0))
+            r = t["ret"] / risk if risk > 0 else 0.0
             self.data["trades"].append({
                 "symbol": symbol,
                 "entry_time": t["entry_time"].isoformat(),
