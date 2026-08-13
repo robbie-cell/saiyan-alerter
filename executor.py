@@ -211,6 +211,7 @@ class Executor:
             "last_update_id": self._update_offset,
             "positions": [p.to_dict() for p in self.positions],
         }
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(self.state_path)
