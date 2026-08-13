@@ -94,6 +94,19 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true   # no artifact yet (first run) is fine
 
+      # Hard guard: if a previous successful run EXISTS but its state did not
+      # download (artifact expiry, API glitch...), fail fast BEFORE scanning.
+      # Without this, main.py treats the missing state as a first run every
+      # time — re-baselining (losing dedupe continuity) and re-sending the
+      # startup + cloud-paper-trader Telegram messages on every run.
+      - name: Verify previous state downloaded
+        if: steps.prev.outputs.run_id != ''
+        run: |
+          if [ ! -f state/saiyan_state.json ]; then
+            echo "Previous successful run ${{ steps.prev.outputs.run_id }} had no downloadable state — aborting to avoid re-baselining and Telegram spam."
+            exit 1
+          fi
+
       - name: Scan closed candles and send new signals
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
