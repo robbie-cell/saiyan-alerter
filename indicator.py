@@ -281,9 +281,19 @@ def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
 
 def aggregate_htf(df: pd.DataFrame, ltf_minutes: int, intres: int) -> pd.DataFrame:
     """Aggregate LTF OHLCV into HTF bars (HTF minutes = ltf_minutes * intres).
-    Drops the last (developing) HTF bar AND the first HTF bucket when `df` doesn't
-    start on an HTF boundary — leading buckets would otherwise aggregate only a partial
-    slice of LTF bars and produce a misleading early MA."""
+    Drops the first HTF bucket when `df` doesn't start on an HTF boundary — leading
+    buckets would otherwise aggregate only a partial slice of LTF bars and produce a
+    misleading early MA.
+
+    The returned frame is indexed by each bucket's *finalization time* (bucket label +
+    HTF minutes): the LTF bar that closes a bucket opens at label + htf_minutes, so the
+    bucket's OHLC only becomes knowable at that instant. Downstream callers reindex/
+    ffill this frame onto the LTF index, which then assigns a bucket's values only to
+    LTF bars at/after its finalization time — never back to the developing bars inside
+    it. That is what keeps the HTF trend (and the HTF variant line) strictly causal:
+    without it, the still-open trailing bucket's close changes as later LTF bars fill
+    it, so the same historical bar yields different HTF values depending on how much
+    future data the window happens to contain."""
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("df.index must be a pandas DatetimeIndex.")
     htf_minutes = ltf_minutes * intres
@@ -295,14 +305,15 @@ def aggregate_htf(df: pd.DataFrame, ltf_minutes: int, intres: int) -> pd.DataFra
     agg = df.resample(rule, origin="start_day").agg({
         "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
     }).dropna()
-    # Drop the leading (potentially partial) bucket if df begins inside the first HTF bucket.
+    # Drop the leading bucket only when df starts strictly inside it (partial leader).
+    # `agg.index[0]` is the leader's start label — df starting exactly on the boundary
+    # means the leader is a full bucket and must be kept.
     # Guard: only drop when at least 2 buckets remain, so we don't yield an empty agg that
     # silently retires the HTF MA. The downstream `if len(htf_df) < cfg.basis_len` check
     # inside `run_indicator` is the second safety net for the single-bucket edge case.
-    if len(agg) >= 2:
-        first_boundary = agg.index[0] - pd.Timedelta(minutes=htf_minutes)
-        if df.index[0] > first_boundary:
-            agg = agg.iloc[1:]
+    if len(agg) >= 2 and df.index[0] > agg.index[0]:
+        agg = agg.iloc[1:]
+    agg.index = agg.index + pd.Timedelta(minutes=htf_minutes)
     return agg
 
 
