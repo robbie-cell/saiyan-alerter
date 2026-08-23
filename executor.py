@@ -535,6 +535,10 @@ class GateExecutor(Executor):
             "enableRateLimit": True,
             "options": {"defaultType": "spot"},
         })
+        # ccxt bybit's load_markets() calls fetch_currencies() → private
+        # GET /v5/asset/coin/query-info, which 403s for keys without that
+        # permission (and is unnecessary — we only need spot markets).
+        self.exchange.has['fetchCurrencies'] = False
         self.exchange.set_sandbox_mode(sandbox)
         self.venue = "testnet" if sandbox else "live"
         self.mode = f"{exchange_id}-{self.venue}"
