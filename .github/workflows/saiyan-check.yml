@@ -124,6 +124,16 @@ jobs:
         # in the repo) — see deploy/gh-actions/README.md.
         run: python main.py check --state state/saiyan_state.json --ledger state/saiyan_ledger.json --exec-state state/saiyan_exec_state.json
 
+      # TEMPORARY (one run): reset the contaminated signal ledger. The ledger
+      # was built by full-window reconstruction under the pre-fix look-ahead
+      # aggregate_htf, which booked trades that never fired live. Deleting it
+      # here makes the NEXT run start a fresh ledger with a new epoch. This
+      # step is removed immediately after the reset run lands.
+      - name: Reset contaminated ledger (temporary)
+        run: |
+          rm -f state/saiyan_ledger.json
+          echo "Ledger reset for clean forward record"
+
       - name: Upload state + ledger for the next run
         uses: actions/upload-artifact@v4
         with:
