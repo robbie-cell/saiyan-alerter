@@ -124,16 +124,6 @@ jobs:
         # in the repo) — see deploy/gh-actions/README.md.
         run: python main.py check --state state/saiyan_state.json --ledger state/saiyan_ledger.json --exec-state state/saiyan_exec_state.json
 
-      # TEMPORARY (one run): reset the paper-trader account. The exec-state
-      # was frozen on a stale phantom XRP short (opened Aug 18, never closed)
-      # from before the look-ahead fix. Deleting it here makes the NEXT run
-      # start a fresh paper account with no positions. Removed immediately
-      # after the reset run lands.
-      - name: Reset paper-trader account (temporary)
-        run: |
-          rm -f state/saiyan_exec_state.json
-          echo "Paper-trader account reset for clean forward record"
-
       - name: Upload state + ledger for the next run
         uses: actions/upload-artifact@v4
         with:
