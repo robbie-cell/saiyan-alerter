@@ -6,19 +6,13 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Probe public endpoints from runner IP
+      - name: Probe OKX demo + gate correct paths
         run: |
           probe() {
             echo "== $1 =="
             curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 15 "$2" || echo "curl failed (exit $?)"
           }
-          echo "== runner IP =="
-          curl -s --max-time 15 https://api.ipify.org; echo
-          probe "kucoin sandbox" "https://api-sandbox.kucoin.com/api/v1/timestamp"
-          probe "bitget testnet" "https://api-testnet.bitget.com/api/v2/public/time"
-          probe "gate testnet" "https://api-testnet.gateapi.io/api/v4/time"
-          probe "okx mainnet" "https://www.okx.com/api/v5/public/time"
-          probe "mexc contract" "https://contract.mexc.com/api/v1/contract/time"
-          probe "bybit demo" "https://api-demo.bybit.com/v5/market/time"
-          probe "bybit testnet" "https://api-testnet.bybit.com/v5/market/time"
-          probe "binance testnet" "https://testnet.binance.vision/api/v3/ping"
+          probe "okx demo public time (x-sim header not needed for public)" "https://www.okx.com/api/v5/public/time"
+          probe "gate testnet spot tickers" "https://api-testnet.gateapi.io/api/v4/spot/tickers"
+          probe "gate testnet currency pairs" "https://api-testnet.gateapi.io/api/v4/spot/currency_pairs"
+          probe "okx spot tickers" "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
