@@ -40,6 +40,7 @@ class ExecutionConfig:
     `live_confirmation: true`.
     """
     mode: str = "off"
+    exchange: str = "gate"   # ccxt id for testnet/live execution venue (gate | bybit)
     size_usdt: float = 25.0
     max_positions: int = 3
     daily_loss_limit_usd: float = 50.0
@@ -162,6 +163,7 @@ def load_config(path: Path = DEFAULT_CFG_PATH) -> RuntimeConfig:
         raise ValueError("`execution.mode` must be one of off|paper|testnet|live.")
     execution = ExecutionConfig(
         mode=mode,
+        exchange=str(ex.get("exchange", "gate")).lower(),
         size_usdt=float(ex.get("size_usdt", 25.0)),
         max_positions=int(ex.get("max_positions", 3)),
         daily_loss_limit_usd=float(ex.get("daily_loss_limit_usd", 50.0)),

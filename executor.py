@@ -521,18 +521,26 @@ class GateExecutor(Executor):
     def __init__(self, ex_cfg, ind_cfg, state_path: Path, sandbox: bool = True):
         super().__init__(ex_cfg, ind_cfg, state_path)
         import ccxt
-        self.exchange = ccxt.gate({
-            "apiKey": os.getenv("GATE_API_KEY", ""),
-            "secret": os.getenv("GATE_API_SECRET", ""),
+        # Venue is configurable (`execution.exchange`) so testnet can run on any
+        # ccxt exchange with a sandbox — e.g. `gate` (api-testnet.gateapi.io) or
+        # `bybit` (api-testnet.bybit.com, no KYC). Market data always comes from
+        # the configured `exchange:` in config.yaml (Gate candles); only order
+        # placement + balance checks hit the sandbox venue.
+        exchange_id = (getattr(ex_cfg, "exchange", None) or "gate").lower()
+        if not hasattr(ccxt, exchange_id):
+            raise SystemExit(f"Unknown execution exchange: {exchange_id}")
+        self.exchange = getattr(ccxt, exchange_id)({
+            "apiKey": os.getenv("EXCHANGE_API_KEY", ""),
+            "secret": os.getenv("EXCHANGE_API_SECRET", ""),
             "enableRateLimit": True,
             "options": {"defaultType": "spot"},
         })
         self.exchange.set_sandbox_mode(sandbox)
         self.venue = "testnet" if sandbox else "live"
-        self.mode = f"gate-{self.venue}"
+        self.mode = f"{exchange_id}-{self.venue}"
         if not self.exchange.apiKey:
             raise SystemExit(
-                f"GATE_API_KEY/GATE_API_SECRET must be set for {self.venue} mode.")
+                f"EXCHANGE_API_KEY/EXCHANGE_API_SECRET must be set for {self.venue} mode.")
         # Restart reconciliation: re-sync open positions against real balances
         # so a close that happened while we were down is never re-traded or
         # double-booked.

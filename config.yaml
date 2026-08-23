@@ -152,7 +152,8 @@ timezone: Australia/Melbourne
 # runs. NEVER put testnet/live keys in the repo — .env is gitignored.
 # ---------------------------------------------------------------------------
 execution:
-  mode: paper               # off | paper | testnet | live
+  mode: testnet             # off | paper | testnet | live
+  exchange: bybit           # ccxt id for the testnet/live execution venue (gate | bybit) — bybit testnet needs no KYC
   size_usdt: 200.0          # notional per entry (top-3 portfolio sizing)
   max_positions: 3
   daily_loss_limit_usd: 50.0

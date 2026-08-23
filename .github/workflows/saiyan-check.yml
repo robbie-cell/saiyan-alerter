@@ -111,6 +111,11 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Testnet/live execution keys (never stored in the repo — GitHub
+          # Secrets). `mode: testnet` requires both; without them the run
+          # fails fast BEFORE scanning (GateExecutor SystemExit).
+          EXCHANGE_API_KEY: ${{ secrets.BYBIT_API }}
+          EXCHANGE_API_SECRET: ${{ secrets.BYBIT_SECRET }}
         # Exit 1 (job goes red) if any pair failed — the next scheduled run
         # retries those pairs. State for successful pairs is already advanced,
         # so nothing is re-sent.
